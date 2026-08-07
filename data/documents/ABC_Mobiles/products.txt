@@ -1,0 +1,340 @@
+ABC Mobiles - Product Catalog
+
+Category: Smartphones
+
+
+Product Name: Samsung Galaxy S25
+
+Brand: Samsung
+
+Price: ₹75,000
+
+RAM: 12GB
+
+Storage: 256GB
+
+Processor: Snapdragon 8 Elite
+
+Display: 6.8-inch AMOLED
+
+Battery: 5000mAh
+
+Camera:
+200MP + 50MP + 12MP Rear Camera
+12MP Front Camera
+
+Warranty: 1 Year
+
+Availability: In Stock
+
+
+--------------------------------------------------
+
+
+Product Name: Samsung Galaxy S25 Ultra
+
+Brand: Samsung
+
+Price: ₹1,20,000
+
+RAM: 12GB
+
+Storage: 512GB
+
+Processor: Snapdragon 8 Elite
+
+Display: 6.9-inch AMOLED
+
+Battery: 5000mAh
+
+Camera:
+200MP Rear Camera
+
+Warranty: 1 Year
+
+Availability: In Stock
+
+
+--------------------------------------------------
+
+
+Product Name: iPhone 16
+
+Brand: Apple
+
+Price: ₹80,000
+
+Storage: 256GB
+
+Processor: Apple A18 Chip
+
+Display: 6.3-inch OLED
+
+Camera:
+48MP Main Camera
+
+Battery: 3561mAh
+
+Warranty: 1 Year
+
+Availability: In Stock
+
+
+--------------------------------------------------
+
+
+Product Name: OnePlus 13
+
+Brand: OnePlus
+
+Price: ₹65,000
+
+RAM: 12GB
+
+Storage: 256GB
+
+Processor: Snapdragon 8 Elite
+
+Display: 6.82-inch AMOLED
+
+Battery: 6000mAh
+
+Warranty: 1 Year
+
+Availability: In Stock
+
+
+--------------------------------------------------
+
+
+Product Name: Nothing Phone 3
+
+Brand: Nothing
+
+Price: ₹52,000
+
+RAM: 12GB
+
+Storage: 256GB
+
+Processor: Snapdragon Processor
+
+Display: AMOLED Display
+
+Warranty: 1 Year
+
+Availability: In Stock
+
+
+--------------------------------------------------
+
+
+Product Name: Vivo X200
+
+Brand: Vivo
+
+Price: ₹58,000
+
+RAM: 12GB
+
+Storage: 256GB
+
+Processor: MediaTek Dimensity Processor
+
+Display: AMOLED Display
+
+Warranty: 1 Year
+
+Availability: In Stock
+
+
+--------------------------------------------------
+
+
+Product Name: Realme GT 7
+
+Brand: Realme
+
+Price: ₹39,999
+
+RAM: 12GB
+
+Storage: 256GB
+
+Processor: High Performance Processor
+
+Display: AMOLED Display
+
+Battery: Large Capacity Battery
+
+Warranty: 1 Year
+
+Availability: In Stock
+
+
+
+==================================================
+
+
+Category: Accessories
+
+
+Product Name: Mobile Covers
+
+Price Range: ₹199 - ₹999
+
+Availability: In Stock
+
+
+Product Name: Screen Guards
+
+Price Range: ₹99 - ₹499
+
+Availability: In Stock
+
+
+Product Name: Fast Chargers
+
+Price Range: ₹499 - ₹2999
+
+Availability: In Stock
+
+
+Product Name: Power Banks
+
+Capacity:
+10000mAh - 20000mAh
+
+Availability: In Stock
+
+
+Product Name: Bluetooth Earbuds
+
+Price Range: ₹999 - ₹4999
+
+Availability: In Stock
+
+
+Product Name: Neckbands
+
+Availability: In Stock
+
+
+Product Name: Bluetooth Speakers
+
+Availability: In Stock
+
+
+Product Name: Smart Watches
+
+Availability: In Stock
+
+
+Product Name: Memory Cards
+
+Storage Options:
+32GB, 64GB, 128GB, 256GB
+
+Availability: In Stock
+
+
+Product Name: USB Cables
+
+Availability: In Stock
+
+
+Product Name: Wireless Chargers
+
+Availability: In Stock
+
+
+Product Name: Laptop Bags
+
+Availability: In Stock
+
+
+Product Name: Laptop Chargers
+
+Availability: In Stock
+
+
+
+==================================================
+
+
+Category: Laptops
+
+
+Product Name: HP Victus Gaming Laptop
+
+Brand: HP
+
+Price: ₹75,000
+
+RAM: 16GB
+
+Storage: 512GB SSD
+
+Processor: AMD Ryzen 7
+
+Graphics: NVIDIA RTX Graphics
+
+Display: 15.6-inch Full HD
+
+Suitable For:
+- Programming
+- Machine Learning
+- Software Development
+- Gaming
+
+Availability: In Stock
+
+
+--------------------------------------------------
+
+
+Product Name: Lenovo IdeaPad Slim 5
+
+Brand: Lenovo
+
+Price: ₹65,000
+
+RAM: 16GB
+
+Storage: 512GB SSD
+
+Processor: Intel Core i7
+
+Display: 15.6-inch Full HD
+
+Suitable For:
+- Coding
+- Students
+- Multitasking
+
+Availability: In Stock
+
+
+--------------------------------------------------
+
+
+Product Name: ASUS Vivobook Pro
+
+Brand: ASUS
+
+Price: ₹85,000
+
+RAM: 16GB
+
+Storage: 1TB SSD
+
+Processor: Intel Core i7
+
+Graphics: Dedicated GPU
+
+Suitable For:
+- AI Development
+- Programming
+- Data Science
+
+Availability: In Stock

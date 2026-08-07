@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+.venv/
+
+# ChromaDB
+data/chroma_db/
+
+# VS Code
+.vscode/
+
+# Temporary debugging files
+temp_*.py
+
+# OS
+.DS_Store
+Thumbs.db
