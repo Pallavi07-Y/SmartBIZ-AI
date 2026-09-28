@@ -131,14 +131,35 @@ class DocumentChunker:
 
         elif any(term in text for term in self.product_terms):
             metadata["type"] = "product"
-            if any(term in text for term in self.laptop_terms):
-                metadata["category"] = "laptop"
-            elif any(brand in text for brand in self.smartphone_brands):
-                metadata["category"] = "smartphone"
-            elif "mobile covers" in text or "screen guards" in text or "chargers" in text or "power banks" in text:
-                metadata["category"] = "accessories"
+
+            explicit_category_keywords = [
+                ("laptop", "laptop"),
+                ("notebook", "laptop"),
+                ("smartphone", "smartphone"),
+                ("phone", "smartphone"),
+            ]
+            for keyword, category in explicit_category_keywords:
+                if keyword in text:
+                    metadata["category"] = category
+                    break
             else:
-                metadata.setdefault("category", "product")
+                # Literal product keywords must outrank generic hardware hints like RAM/SSD,
+                # while preserving brand-based smartphone detection for names such as
+                # "Samsung Galaxy S25".
+                smartphone_identifiers = self.smartphone_brands + [
+                    "galaxy",
+                    "pixel",
+                ]
+                if any(identifier in text for identifier in smartphone_identifiers):
+                    metadata["category"] = "smartphone"
+                elif any(term in text for term in self.laptop_terms):
+                    metadata["category"] = "laptop"
+                elif "mobile covers" in text or "screen guards" in text or "chargers" in text or "power banks" in text:
+                    metadata["category"] = "accessories"
+                elif any(term in text for term in ["ram", "gb", "ssd"]):
+                    metadata["category"] = "laptop"
+                else:
+                    metadata.setdefault("category", "product")
 
         else:
             # Default to product for content-rich chunks and business only for pure profile blocks

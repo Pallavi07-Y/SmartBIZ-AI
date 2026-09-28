@@ -1,30 +1,45 @@
-import json
-import uuid
-import os
+from app.database import Business, configure_database, get_session
 
 
 class BusinessDB:
-
-    FILE = "data/businesses.json"
-
     def __init__(self):
-        os.makedirs("data", exist_ok=True)
-
-        if not os.path.exists(self.FILE):
-            with open(self.FILE, "w") as f:
-                json.dump([], f)
+        configure_database()
 
     def add_business(self, business):
-
-        with open(self.FILE, "r") as f:
-            businesses = json.load(f)
-
-        businesses.append(business)
-
-        with open(self.FILE, "w") as f:
-            json.dump(businesses, f, indent=4)
+        session = get_session()
+        try:
+            session.add(Business(
+                business_id=business["business_id"],
+                name=business["name"],
+                category=business.get("category"),
+                address=business.get("address"),
+                owner_phone=business.get("owner_phone"),
+                username=business.get("username"),
+                password_hash=business.get("password_hash"),
+            ))
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     def get_all(self):
-
-        with open(self.FILE, "r") as f:
-            return json.load(f)
+        session = get_session()
+        try:
+            businesses = session.query(Business).all()
+            return [
+                {
+                    "business_id": business.business_id,
+                    "name": business.name,
+                    "category": business.category,
+                    "address": business.address,
+                    "owner_phone": business.owner_phone,
+                    "username": business.username,
+                    "password_hash": business.password_hash,
+                    "created_at": business.created_at,
+                }
+                for business in businesses
+            ]
+        finally:
+            session.close()

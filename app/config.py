@@ -19,7 +19,6 @@ class Settings:
     # ==========================
     # xAI Configuration
     # ==========================
-    API_KEY = os.getenv("API_KEY")
     BASE_URL = os.getenv("BASE_URL")
     MODEL = os.getenv("MODEL")
     DOCUMENT_PATH = "data/documents"
@@ -35,10 +34,12 @@ class Settings:
 
     EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
+    @property
+    def API_KEY(self):
+        api_key = os.getenv("API_KEY")
+        if not api_key:
+            raise ValueError(" API_KEY not found in .env file")
+        return api_key
+
 
 settings = Settings()
-
-
-# Validate Required Values
-if not settings.API_KEY:
-    raise ValueError(" API_KEY not found in .env file")

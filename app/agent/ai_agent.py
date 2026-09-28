@@ -1,12 +1,21 @@
-from app.llm.llm import LLM
-from app.prompts.system_prompt import SYSTEM_PROMPT
+import re
+
 from app.agent.memory import ConversationMemory
 from app.agent.tools import AgentTools
+from app.database import (
+    Conversation,
+    ConversationStatus,
+    Message,
+    MessageSender,
+    get_session,
+)
+from app.llm.llm import LLM
+from app.prompts.system_prompt import SYSTEM_PROMPT
 from app.utils.logger import logger
-import re
 
 
 class AIAgent:
+
 
     def __init__(self):
 
@@ -16,14 +25,155 @@ class AIAgent:
 
         self.tools = AgentTools()
 
+    @staticmethod
+    def _is_explicit_human_request(message):
+        text = (message or "").lower()
+        triggers = [
+            "talk to owner",
+            "talk to the owner",
+            "speak to owner",
+            "talk to a person",
+            "speak to a person",
+            "talk to a human",
+            "speak to a human",
+            "talk to someone",
+            "speak to someone",
+            "human support",
+            "customer service",
+            "escalate",
+            "need a human",
+            "need the owner",
+            "i need to speak to the owner",
+            "please connect me to a person",
+            "please connect me to the owner",
+        ]
+        return any(trigger in text for trigger in triggers)
+
+    @staticmethod
+    def _is_complaint_or_frustration(message):
+        text = (message or "").lower()
+        complaint_words = [
+            "complaint",
+            "complain",
+            "frustrated",
+            "angry",
+            "annoyed",
+            "upset",
+            "disappointed",
+            "very unhappy",
+            "not happy",
+            "terrible",
+            "awful",
+            "hate this",
+            "bad experience",
+            "this is ridiculous",
+            "worst",
+            "really upset",
+        ]
+        return any(word in text for word in complaint_words)
+
+    @staticmethod
+    def _should_escalate(user_query, context=None, generated_response=None):
+        if not user_query:
+            return False
+
+        explicit_human_request = AIAgent._is_explicit_human_request(user_query)
+        complaint = AIAgent._is_complaint_or_frustration(user_query)
+
+        if context is None or context == "No business information found.":
+            context = None
+
+        if generated_response is not None and generated_response.strip() == "I don't have that information in the business knowledge base.":
+            generated_response = generated_response.strip()
+
+        return explicit_human_request or complaint
+
+    def _handle_human_escalation(self, business_id, user_query, customer_phone=None):
+        session = get_session()
+        try:
+            conversation = (
+                session.query(Conversation)
+                .filter(
+                    Conversation.business_id == business_id,
+                    Conversation.customer_phone == customer_phone,
+                )
+                .order_by(Conversation.created_at.desc())
+                .first()
+            )
+
+            if conversation is None:
+                conversation = Conversation(
+                    business_id=business_id,
+                    customer_phone=customer_phone,
+                    status=ConversationStatus.ESCALATED,
+                )
+                session.add(conversation)
+                session.flush()
+            elif conversation.status in {ConversationStatus.ESCALATED, ConversationStatus.KEEPER_HANDLING}:
+                session.add(
+                    Message(
+                        conversation_id=conversation.id,
+                        sender=MessageSender.CUSTOMER,
+                        text=user_query,
+                    )
+                )
+                session.commit()
+                return {"signal": "awaiting_human", "reply": None}
+
+            conversation.status = ConversationStatus.ESCALATED
+            session.add(
+                Message(
+                    conversation_id=conversation.id,
+                    sender=MessageSender.CUSTOMER,
+                    text=user_query,
+                )
+            )
+            session.commit()
+            return {"signal": "awaiting_human", "reply": None}
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     def chat(
         self,
         business_id,
-        user_query
+        user_query,
+        customer_phone=None,
     ):
 
         try:
+            session = get_session()
+            try:
+                conversation = (
+                    session.query(Conversation)
+                    .filter(
+                        Conversation.business_id == business_id,
+                        Conversation.customer_phone == customer_phone,
+                    )
+                    .order_by(Conversation.created_at.desc())
+                    .first()
+                )
+                if conversation is not None and conversation.status in {ConversationStatus.ESCALATED, ConversationStatus.KEEPER_HANDLING}:
+                    session.add(
+                        Message(
+                            conversation_id=conversation.id,
+                            sender=MessageSender.CUSTOMER,
+                            text=user_query,
+                        )
+                    )
+                    session.commit()
+                    return {"signal": "awaiting_human", "reply": None}
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+            if self._is_explicit_human_request(user_query) or self._is_complaint_or_frustration(user_query):
+                return self._handle_human_escalation(business_id, user_query, customer_phone)
+
 
             # Get previous conversation
             history = self.memory.get_history()
@@ -116,7 +266,7 @@ class AIAgent:
                 response = self.llm.generate_response(messages)
                 self.memory.add_message("user", user_query)
                 self.memory.add_message("assistant", response)
-                return response
+                return {"signal": "reply", "reply": response}
 
             # Retrieve business knowledge using only the resolved question
             context = self.tools.get_business_context(
@@ -144,7 +294,7 @@ class AIAgent:
             if not context or context == "No business information found.":
                 response = "I don't have that information in the business knowledge base."
                 self.memory.add_message("assistant", response)
-                return response
+                return {"signal": "reply", "reply": response}
 
             messages = [
 
@@ -201,8 +351,10 @@ class AIAgent:
                 response
             )
 
+            if self._should_escalate(user_query, context=context, generated_response=response):
+                return self._handle_human_escalation(business_id, user_query, customer_phone)
 
-            return response
+            return {"signal": "reply", "reply": response}
 
 
         except Exception as e:

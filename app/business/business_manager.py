@@ -1,4 +1,5 @@
 from app.business.register_business import BusinessManager
+from app.utils.auth import hash_password
 from app.business.upload_documents import DocumentUploader
 from app.business.search_business import BusinessSearch
 
@@ -17,12 +18,20 @@ class BusinessController:
     def create_business(
         self,
         name,
-        category
+        category,
+        address=None,
+        owner_phone=None,
+        username=None,
+        password=None,
     ):
 
         return self.register.register_business(
             name,
-            category
+            category,
+            address=address,
+            owner_phone=owner_phone,
+            username=username,
+            password_hash=hash_password(password) if password else None,
         )
 
 

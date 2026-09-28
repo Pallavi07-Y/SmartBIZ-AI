@@ -22,7 +22,10 @@ def main():
 
         response = agent.chat(business_id, user_input)
 
-        print(f"AI: {response}")
+        if response.get("signal") == "awaiting_human":
+            print("AI: Your message has been sent to the shop owner. Please wait for their response.")
+        else:
+            print(f"AI: {response.get('reply', '')}")
 
 
 if __name__ == "__main__":

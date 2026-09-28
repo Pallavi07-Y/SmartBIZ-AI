@@ -8,6 +8,7 @@ from app.rag.chunking import DocumentChunker
 from app.business.catalog import BusinessCatalog
 from app.utils.helpers import generate_order_id, validate_phone_number
 from app.utils.logger import logger
+from app.database import CartItem, Order, configure_database, get_session
 
 
 class AgentTools:
@@ -16,8 +17,7 @@ class AgentTools:
 
         self.business = BusinessController()
         self.rag = RAGPipeline()
-        self.carts = {}
-        self.orders = {}
+        configure_database()
 
 
     def get_business_details(
@@ -164,35 +164,81 @@ class AgentTools:
         if quantity < 1:
             return {"error": "Quantity must be at least 1."}
 
-        cart = self.carts.setdefault(session_id, [])
-        existing = next((item for item in cart if item["product_name"].lower() == product_name.lower()), None)
-        if existing:
-            existing["quantity"] += quantity
-        else:
-            cart.append({
-                "product_name": product["product_name"],
-                "quantity": quantity,
-                "price": product.get("price"),
-                "availability": product.get("availability")
-            })
-
-        return {"cart": cart}
+        session = get_session()
+        try:
+            cart_items = session.query(CartItem).filter_by(
+                session_id=session_id,
+                business_id=business_id,
+            ).all()
+            existing = next(
+                (
+                    item for item in cart_items
+                    if item.product_name.lower() == product_name.lower()
+                ),
+                None,
+            )
+            if existing:
+                existing.quantity += quantity
+            else:
+                session.add(CartItem(
+                    session_id=session_id,
+                    business_id=business_id,
+                    product_name=product["product_name"],
+                    quantity=quantity,
+                    price=product.get("price"),
+                    availability=product.get("availability"),
+                ))
+            session.commit()
+            return {"cart": self._get_cart(session, session_id)}
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     def remove_from_cart(self, session_id, product_name):
 
-        cart = self.carts.get(session_id, [])
-        cart = [item for item in cart if item["product_name"].lower() != product_name.lower()]
-        self.carts[session_id] = cart
-        return {"cart": cart}
+        session = get_session()
+        try:
+            items = session.query(CartItem).filter_by(session_id=session_id).all()
+            for item in items:
+                if item.product_name.lower() == product_name.lower():
+                    session.delete(item)
+            session.commit()
+            return {"cart": self._get_cart(session, session_id)}
+        finally:
+            session.close()
 
     def clear_cart(self, session_id):
 
-        self.carts[session_id] = []
-        return {"cart": []}
+        session = get_session()
+        try:
+            session.query(CartItem).filter_by(session_id=session_id).delete()
+            session.commit()
+            return {"cart": []}
+        finally:
+            session.close()
 
     def get_cart(self, session_id):
 
-        return self.carts.get(session_id, [])
+        session = get_session()
+        try:
+            return self._get_cart(session, session_id)
+        finally:
+            session.close()
+
+    @staticmethod
+    def _cart_item_to_dict(item):
+        return {
+            "product_name": item.product_name,
+            "quantity": item.quantity,
+            "price": item.price,
+            "availability": item.availability,
+        }
+
+    def _get_cart(self, session, session_id):
+        items = session.query(CartItem).filter_by(session_id=session_id).all()
+        return [self._cart_item_to_dict(item) for item in items]
 
     def create_order(self, business_id, customer_name, phone, product_name, quantity=1):
 
@@ -215,27 +261,66 @@ class AgentTools:
             return {"error": "Quantity must be at least 1."}
 
         order_id = generate_order_id()
-        total = price * quantity
-        order = {
-            "order_id": order_id,
-            "business_id": business_id,
-            "customer_name": customer_name,
-            "phone": phone,
+        order_items = [{
             "product_name": product["product_name"],
             "quantity": quantity,
             "price": price,
-            "total": total,
-            "status": "confirmed"
-        }
-
-        self.orders.setdefault(business_id, []).append(order)
-        return order
+            "availability": product.get("availability"),
+            "customer_name": customer_name,
+        }]
+        session = get_session()
+        try:
+            session.add(Order(
+                id=order_id,
+                business_id=business_id,
+                customer_phone=phone,
+                items=order_items,
+                status="confirmed",
+            ))
+            session.commit()
+            return self._order_to_dict(session.get(Order, order_id))
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     def get_order_status(self, business_id, order_id):
 
-        business_orders = self.orders.get(business_id, [])
-        return next((order for order in business_orders if order["order_id"] == order_id), None)
+        session = get_session()
+        try:
+            order = session.query(Order).filter_by(
+                id=order_id,
+                business_id=business_id,
+            ).first()
+            return self._order_to_dict(order) if order else None
+        finally:
+            session.close()
 
     def get_recent_orders(self, business_id):
 
-        return self.orders.get(business_id, [])
+        session = get_session()
+        try:
+            orders = session.query(Order).filter_by(
+                business_id=business_id,
+            ).order_by(Order.created_at).all()
+            return [self._order_to_dict(order) for order in orders]
+        finally:
+            session.close()
+
+    @staticmethod
+    def _order_to_dict(order):
+        item = order.items[0]
+        quantity = item["quantity"]
+        price = item["price"]
+        return {
+            "order_id": order.id,
+            "business_id": order.business_id,
+            "customer_name": item.get("customer_name"),
+            "phone": order.customer_phone,
+            "product_name": item["product_name"],
+            "quantity": quantity,
+            "price": price,
+            "total": price * quantity,
+            "status": order.status,
+        }

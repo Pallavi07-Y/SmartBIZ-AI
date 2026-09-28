@@ -1,0 +1,21 @@
+import bcrypt
+
+
+def hash_password(password):
+    return bcrypt.hashpw(
+        password.encode("utf-8"),
+        bcrypt.gensalt(),
+    ).decode("utf-8")
+
+
+def verify_password(password, stored_hash):
+    if not isinstance(password, str) or not isinstance(stored_hash, str):
+        return False
+
+    try:
+        return bcrypt.checkpw(
+            password.encode("utf-8"),
+            stored_hash.encode("utf-8"),
+        )
+    except (ValueError, TypeError, UnicodeError):
+        return False

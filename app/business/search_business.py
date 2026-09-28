@@ -1,13 +1,10 @@
-import json
-
-from app.business.register_business import BUSINESS_FILE
+from app.database import Business, configure_database, get_session
 
 
 class BusinessSearch:
 
     def __init__(self):
-
-        self.file = BUSINESS_FILE
+        configure_database()
 
 
     def search_by_id(
@@ -15,22 +12,12 @@ class BusinessSearch:
         business_id
     ):
 
-        with open(
-            self.file,
-            "r"
-        ) as file:
-
-            businesses = json.load(file)
-
-
-        for business in businesses:
-
-            if business["business_id"] == business_id:
-
-                return business
-
-
-        return None
+        session = get_session()
+        try:
+            business = session.get(Business, business_id)
+            return self._to_dict(business) if business else None
+        finally:
+            session.close()
 
 
     def search_by_name(
@@ -38,24 +25,24 @@ class BusinessSearch:
         name
     ):
 
-        with open(
-            self.file,
-            "r"
-        ) as file:
+        session = get_session()
+        try:
+            businesses = session.query(Business).filter(
+                Business.name.ilike(f"%{name}%")
+            ).all()
+            return [self._to_dict(business) for business in businesses]
+        finally:
+            session.close()
 
-            businesses = json.load(file)
-
-
-        results = []
-
-
-        for business in businesses:
-
-            if name.lower() in business["name"].lower():
-
-                results.append(
-                    business
-                )
-
-
-        return results
+    @staticmethod
+    def _to_dict(business):
+        return {
+            "business_id": business.business_id,
+            "name": business.name,
+            "category": business.category,
+            "address": business.address,
+            "owner_phone": business.owner_phone,
+            "username": business.username,
+            "password_hash": business.password_hash,
+            "created_at": business.created_at,
+        }
