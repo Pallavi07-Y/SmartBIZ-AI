@@ -9,14 +9,19 @@ __pycache__/
 venv/
 .venv/
 
+# Database
+*.sqlite3
+
 # ChromaDB
 data/chroma_db/
 
-# VS Code
-.vscode/
-
 # Temporary debugging files
 temp_*.py
+tmp_debug.sqlite3
+tmpseedcheck/
+
+# VS Code
+.vscode/
 
 # OS
 .DS_Store

@@ -1,21 +1,180 @@
 import re
 
+from app.database import Product, get_session
 from app.rag.document_loader import DocumentLoader
 from app.rag.chunking import DocumentChunker
 
 
 class BusinessCatalog:
 
+    DEFAULT_PRODUCTS = [
+        {
+            "product_name": "Samsung Galaxy S25",
+            "brand": "Samsung",
+            "price": 75000,
+            "price_text": "₹75,000",
+            "ram": "12GB",
+            "storage": "256GB",
+            "processor": "Snapdragon 8 Elite",
+            "availability": "In Stock",
+            "category": "smartphone",
+        },
+        {
+            "product_name": "Samsung Galaxy S25 Ultra",
+            "brand": "Samsung",
+            "price": 120000,
+            "price_text": "₹1,20,000",
+            "ram": "12GB",
+            "storage": "512GB",
+            "processor": "Snapdragon 8 Elite",
+            "availability": "In Stock",
+            "category": "smartphone",
+        },
+        {
+            "product_name": "iPhone 16",
+            "brand": "Apple",
+            "price": 80000,
+            "price_text": "₹80,000",
+            "storage": "256GB",
+            "processor": "Apple A18 Chip",
+            "availability": "In Stock",
+            "category": "smartphone",
+        },
+        {
+            "product_name": "OnePlus 13",
+            "brand": "OnePlus",
+            "price": 65000,
+            "price_text": "₹65,000",
+            "ram": "12GB",
+            "storage": "256GB",
+            "processor": "Snapdragon 8 Elite",
+            "availability": "In Stock",
+            "category": "smartphone",
+        },
+        {
+            "product_name": "Nothing Phone 3",
+            "brand": "Nothing",
+            "price": 52000,
+            "price_text": "₹52,000",
+            "ram": "12GB",
+            "storage": "256GB",
+            "processor": "Snapdragon Processor",
+            "availability": "In Stock",
+            "category": "smartphone",
+        },
+    ]
+
     def __init__(self, business_id):
 
         self.business_id = business_id
         self.loader = DocumentLoader()
         self.chunker = DocumentChunker()
-        self.documents = self.loader.load_folder(f"data/documents/{business_id}/")
-        self.chunks = self.chunker.split_documents(self.documents)
-        self.products = self._parse_products()
+        self.documents = []
+        self.chunks = []
+
+        self.products = self._load_products_from_db()
+        if not self.products:
+            folder = f"data/documents/{business_id}/"
+            try:
+                self.documents = self.loader.load_folder(folder)
+            except FileNotFoundError:
+                self.documents = []
+            except Exception:
+                self.documents = []
+
+            if self.documents:
+                self.chunks = self.chunker.split_documents(self.documents)
+            else:
+                self.chunks = []
+
+            self.products = self._parse_products()
+            if not self.products:
+                self.products = [dict(product) for product in self.DEFAULT_PRODUCTS]
+                for product in self.products:
+                    product["business_id"] = self.business_id
+
         self.faq_items = self._parse_faqs()
         self.business_info = self._parse_business_info()
+
+    def _load_products_from_db(self):
+        session = get_session()
+        try:
+            products = (
+                session.query(Product)
+                .filter(Product.business_id == self.business_id, Product.is_active.is_(True))
+                .order_by(Product.created_at.desc())
+                .all()
+            )
+            return [self._product_to_dict(product) for product in products]
+        finally:
+            session.close()
+
+    @staticmethod
+    def _product_to_dict(product):
+        price = product.price
+        availability = product.availability or ("Out of Stock" if (product.stock_quantity or 0) <= 0 else "In Stock")
+        ram_value = product.ram_gb
+        storage_value = product.storage_gb
+        return {
+            "id": product.id,
+            "business_id": product.business_id,
+            "product_name": product.product_name,
+            "sku": product.sku,
+            "category": product.category or "product",
+            "brand": product.brand or "",
+            "price": price,
+            "price_text": f"₹{price:,}" if price is not None else None,
+            "ram": f"{ram_value}GB" if ram_value is not None else None,
+            "storage": f"{storage_value}GB" if storage_value is not None else None,
+            "processor": product.processor or "",
+            "availability": availability,
+            "stock_quantity": product.stock_quantity or 0,
+            "low_stock_threshold": product.low_stock_threshold or 0,
+            "description": product.description or "",
+            "is_active": product.is_active,
+        }
+
+    def sync_products_to_rag(self, vector_store=None):
+        if not self.products:
+            return {"business_id": self.business_id, "documents_added": 0, "status": "no_products"}
+
+        from types import SimpleNamespace
+        if vector_store is None:
+            from app.rag.vector_store import VectorStore
+            vector_store = VectorStore()
+
+        collection_name = f"business_{self.business_id}"
+
+        vector_store.db.delete_by_metadata(
+            collection_name,
+            {"$and": [{"business_id": self.business_id}, {"document_type": "product"}]},
+        )
+
+        documents = []
+        for product in self.products:
+            if not product.get("product_name"):
+                continue
+            context = self.get_product_context(product["product_name"])
+            if context:
+                documents.append(
+                    SimpleNamespace(
+                        page_content=context,
+                        metadata={
+                            "business_id": self.business_id,
+                            "product_id": f"product_{product.get('id') or product['product_name']}",
+                            "document_type": "product",
+                            "type": "product",
+                            "category": product.get("category") or "product",
+                            "brand": product.get("brand") or "",
+                        },
+                    )
+                )
+
+        if not documents:
+            return {"business_id": self.business_id, "documents_added": 0, "status": "no_product_context"}
+
+        result = vector_store.add_documents(collection_name, documents, self.business_id)
+        return {"business_id": self.business_id, "documents_added": len(documents), "status": result}
 
     def _normalize_text(self, text):
         return text.strip().replace("\r", "").replace("\n", " ").strip()
@@ -172,13 +331,21 @@ class BusinessCatalog:
 
         parts = []
         parts.append(f"Product Name: {product.get('product_name')}")
-        for key in ["brand", "price_text", "ram", "storage", "processor", "availability", "category"]:
+        if product.get("sku"):
+            parts.append(f"SKU: {product['sku']}")
+        price_text = product.get("price_text")
+        if not price_text and product.get("price") is not None:
+            price_text = f"₹{int(product['price']):,}"
+        if price_text:
+            parts.append(f"Price: {price_text}")
+        if product.get("availability"):
+            parts.append(f"Availability: {product['availability']}")
+        if product.get("stock_quantity") is not None:
+            parts.append(f"Stock Quantity: {product['stock_quantity']}")
+        for key in ["brand", "ram", "storage", "processor", "category", "description"]:
             value = product.get(key)
             if value:
-                if key == "price_text":
-                    parts.append(f"Price: {value}")
-                else:
-                    parts.append(f"{key.replace('_', ' ').title()}: {value}")
+                parts.append(f"{key.replace('_', ' ').title()}: {value}")
 
         return "\n".join(parts)
 

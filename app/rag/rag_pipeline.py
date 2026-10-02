@@ -16,7 +16,12 @@ class RAGPipeline:
         "inventory",
         "item",
         "catalog",
-        "list"
+        "list",
+        "charger",
+        "chargers",
+        "accessory",
+        "accessories",
+        "usb-c",
     ]
 
     SPECIFIC_PRODUCT_KEYWORDS = [
@@ -37,6 +42,11 @@ class RAGPipeline:
         "support",
         "delivery",
         "warranty",
+        "return",
+        "refund",
+        "exchange",
+        "policy",
+        "policies",
         "home delivery",
         "payment"
     ]
@@ -98,6 +108,29 @@ class RAGPipeline:
         "payment methods:",
         "complete business knowledge base",
         "about our shop"
+    ]
+
+    BUSINESS_PROFILE_QUERY_TERMS = [
+        "shop name",
+        "business name",
+        "name of the shop",
+        "name of this shop",
+        "name of the business",
+        "what is this shop",
+    ]
+
+    BUSINESS_PROFILE_DOCUMENT_MARKERS = [
+        "business name:",
+        "business id:",
+        "owner:",
+        "address:",
+        "contact number:",
+        "email:",
+        "website:",
+        "working hours:",
+        "payment methods:",
+        "complete business knowledge base",
+        "about our shop",
     ]
 
     LAPTOP_TERMS = [
@@ -181,7 +214,7 @@ class RAGPipeline:
 
         text = query.lower()
 
-        return any(keyword in text for keyword in self.BUSINESS_QUERY_KEYWORDS)
+        return any(keyword in text for keyword in self.BUSINESS_QUERY_KEYWORDS + self.BUSINESS_PROFILE_QUERY_TERMS)
 
 
     def _is_faq_query(self, query):
@@ -237,6 +270,9 @@ class RAGPipeline:
         text = query.strip().lower()
         if not text:
             return False
+
+        if any(term in text for term in self.BUSINESS_PROFILE_QUERY_TERMS):
+            return True
 
         if self.is_casual_query(text):
             return False
@@ -357,13 +393,19 @@ class RAGPipeline:
 
         filtered = []
         product_phrases = self._extract_product_phrases(query)
+        if any(term in text for term in self.BUSINESS_PROFILE_QUERY_TERMS):
+            filtered = [
+                (doc, dist) for doc, dist in document_distances
+                if dist <= threshold and any(term in doc.casefold() for term in ("business name:", "shop name:"))
+            ]
+
         if product_phrases:
             logger.debug("RAG query product phrases: %s", product_phrases)
             phrase_filtered = [
                 (doc, dist) for doc, dist in document_distances
                 if dist <= threshold and any(self._phrase_matches(doc, phrase) for phrase in product_phrases)
             ]
-            if phrase_filtered:
+            if phrase_filtered and not filtered:
                 filtered = phrase_filtered
 
         if not filtered:
@@ -413,7 +455,7 @@ class RAGPipeline:
             normalized = doc.strip()
             if not normalized or normalized in seen:
                 continue
-            if any(term in normalized.lower() for term in self.BUSINESS_PROFILE_TERMS) and self._is_product_query(text):
+            if any(term in normalized.lower() for term in self.BUSINESS_PROFILE_DOCUMENT_MARKERS) and self._is_product_query(text):
                 continue
             seen.add(normalized)
             unique.append((normalized, dist))
@@ -423,9 +465,12 @@ class RAGPipeline:
 
     def _get_metadata_filter(self, query):
 
-        # Use metadata filtering only for business/profile or FAQ-style queries.
-        # Product queries are handled by semantic search plus phrase filtering because
-        # document chunk classification may be inconsistent.
+        if self._is_product_query(query):
+            return {"type": "product"}
+
+        if any(term in query.casefold() for term in self.BUSINESS_PROFILE_QUERY_TERMS):
+            return {"type": "business"}
+
         if self._is_faq_query(query):
             return {"type": "faq"}
 

@@ -1,4 +1,5 @@
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -104,6 +105,47 @@ def test_agent_does_not_reply_if_conversation_already_escalated():
         assert session.query(Message).filter_by(conversation_id=conversation.id).count() == 1
     finally:
         session.close()
+
+
+def test_business_insights_use_verified_metrics_and_structured_llm_output(monkeypatch):
+    agent = AIAgent.__new__(AIAgent)
+    captured = {}
+
+    def fake_context(business_id, query):
+        assert business_id == "shop-a"
+        captured["query"] = query
+        return "Return policy: unopened items may be returned within 14 days."
+
+    def fake_response(messages, **kwargs):
+        captured["messages"] = messages
+        captured["kwargs"] = kwargs
+        return (
+            '{"summary":"Recorded revenue is ₹200.","order_insights":[], '
+            '"inventory_insights":[],"customer_insights":[], '
+            '"operational_issues":[],"suggested_actions":[]}'
+        )
+
+    agent.tools = SimpleNamespace(get_business_context=fake_context)
+    agent.llm = SimpleNamespace(generate_response=fake_response)
+    metrics = {"business_id": "shop-a", "revenue": 200, "total_orders": 1}
+
+    insights = agent.generate_business_insights("shop-a", metrics)
+
+    assert insights["summary"] == "Recorded revenue is ₹200."
+    assert captured["kwargs"]["temperature"] == 0.2
+    assert '"revenue": 200' in captured["messages"][1]["content"]
+    assert "14 days" in captured["messages"][1]["content"]
+
+
+def test_business_insight_llm_failure_is_reported(monkeypatch):
+    agent = AIAgent.__new__(AIAgent)
+    agent.tools = SimpleNamespace(get_business_context=lambda *args: None)
+    agent.llm = SimpleNamespace(
+        generate_response=lambda *args, **kwargs: "Sorry, something went wrong while generating the response."
+    )
+
+    with pytest.raises(RuntimeError, match="LLM"):
+        agent.generate_business_insights("shop-a", {"revenue": 0})
 
 
 def main():

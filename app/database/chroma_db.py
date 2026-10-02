@@ -38,22 +38,17 @@ class ChromaDBManager:
         metadatas = []
 
         for index, doc in enumerate(documents):
-
-            ids.append(
-                f"{business_id}_{uuid.uuid4()}"
-            )
-
-            texts.append(
-                doc.page_content
-            )
-
-            metadata = dict(doc.metadata)
-
+            metadata = dict(doc.metadata or {})
             metadata["business_id"] = business_id
 
-            metadatas.append(
-                metadata
-            )
+            stable_id = metadata.get("product_id") or metadata.get("document_id")
+            if stable_id is None:
+                source_label = (metadata.get("document_name") or metadata.get("source") or "chunk").replace(".", "_").replace(" ", "_")
+                stable_id = f"{business_id}_{source_label}_{index:03d}"
+
+            ids.append(str(stable_id))
+            texts.append(doc.page_content)
+            metadatas.append(metadata)
 
         collection.add(
             ids=ids,
@@ -100,6 +95,14 @@ class ChromaDBManager:
         )
 
         return results
+
+    def delete_by_metadata(self, collection_name, metadata_filter):
+        collection = self.get_collection(collection_name)
+        try:
+            collection.delete(where=metadata_filter)
+            return True
+        except Exception:
+            return False
 
     def delete_collection(self, collection_name):
 

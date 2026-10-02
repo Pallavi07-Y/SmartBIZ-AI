@@ -75,3 +75,53 @@ def test_retriever_flattens_single_query_chroma_results():
         "distances": [0.1, 0.2],
         "metadatas": [{"rank": 1}, {"rank": 2}],
     }
+
+
+def test_shop_name_query_uses_business_profile_context():
+    class FakeRetriever:
+        metadata_filter = None
+
+        def retrieve(self, collection_name, query, top_k=10, metadata_filter=None):
+            self.metadata_filter = metadata_filter
+            return {
+                "documents": [
+                    "Delivery Information: Local dispatch is available.",
+                    "Business Name: North Shop\nBusiness ID: shop-a\nCategory: Grocery",
+                ],
+                "distances": [0.1, 0.2],
+                "metadatas": [
+                    {"type": "faq", "business_id": "shop-a"},
+                    {"type": "business", "business_id": "shop-a"},
+                ],
+            }
+
+    pipeline = RAGPipeline.__new__(RAGPipeline)
+    pipeline.retriever = FakeRetriever()
+
+    context = pipeline.retrieve_context("business_shop-a", "what is the shop name?")
+
+    assert pipeline.retriever.metadata_filter == {"type": "business"}
+    assert "Business Name: North Shop" in context
+    assert "Delivery Information" not in context
+
+
+def test_exact_charger_query_uses_product_document_filter():
+    class FakeRetriever:
+        metadata_filter = None
+
+        def retrieve(self, collection_name, query, top_k=10, metadata_filter=None):
+            self.metadata_filter = metadata_filter
+            return {
+                "documents": ["Product Name: USB-C Fast Charger\nCategory: Mobile Accessories\nPrice: ₹1,999"],
+                "distances": [0.1],
+                "metadatas": [{"document_type": "product", "business_id": "shop-a"}],
+            }
+
+    pipeline = RAGPipeline.__new__(RAGPipeline)
+    pipeline.retriever = FakeRetriever()
+
+    context = pipeline.retrieve_context("business_shop-a", "tell me about USB-C Fast Charger")
+
+    assert pipeline.retriever.metadata_filter == {"type": "product"}
+    assert "Product Name: USB-C Fast Charger" in context
+    assert "Category: Mobile Accessories" in context
