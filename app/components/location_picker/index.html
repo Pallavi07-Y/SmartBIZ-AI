@@ -1,0 +1,113 @@
+﻿<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      body {
+        margin: 0;
+        font-family: "DM Sans", "Segoe UI", sans-serif;
+      }
+      button {
+        border: 0;
+        border-radius: 9px;
+        background: #176b5b;
+        color: #fff;
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 14px;
+        font-weight: 600;
+        padding: 0.65rem 1rem;
+      }
+      button:disabled {
+        cursor: wait;
+        opacity: 0.7;
+      }
+      #status {
+        color: #52635d;
+        font-size: 13px;
+        margin-top: 0.4rem;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="use-location" type="button">Use My Location</button>
+    <div id="status" role="status"></div>
+    <script>
+      const button = document.getElementById("use-location");
+      const status = document.getElementById("status");
+
+      function setValue(value) {
+        window.parent.postMessage({
+          isStreamlitMessage: true,
+          type: "streamlit:setComponentValue",
+          value,
+          dataType: "json"
+        }, "*");
+      }
+
+      function setFrameHeight() {
+        window.parent.postMessage({
+          isStreamlitMessage: true,
+          type: "streamlit:setFrameHeight",
+          height: document.body.scrollHeight
+        }, "*");
+      }
+
+      button.addEventListener("click", () => {
+        if (!navigator.geolocation) {
+          status.textContent = "This browser does not support location. Enter a town instead.";
+          setValue({
+            status: "error",
+            message: "This browser does not support location.",
+            request_id: crypto.randomUUID()
+          });
+          return;
+        }
+
+        button.disabled = true;
+        status.textContent = "Waiting for location permission...";
+        navigator.geolocation.getCurrentPosition(
+          (position) => {
+            status.textContent = "Location received. Finding nearby shops...";
+            setValue({
+              status: "success",
+              latitude: position.coords.latitude,
+              longitude: position.coords.longitude,
+              request_id: crypto.randomUUID()
+            });
+          },
+          (error) => {
+            const message = error.code === error.PERMISSION_DENIED
+              ? "Location permission was denied. Enter a town to search manually."
+              : "Unable to get your location. Enter a town to search manually.";
+            status.textContent = message;
+            setValue({
+              status: "error",
+              message,
+              request_id: crypto.randomUUID()
+            });
+            button.disabled = false;
+          },
+          { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 }
+        );
+      });
+
+      window.addEventListener("message", (event) => {
+        if (event.data && event.data.type === "streamlit:render") {
+          button.disabled = false;
+          const label = event.data.args && event.data.args.button_label;
+          if (label) {
+            button.textContent = label;
+          }
+        }
+      });
+
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:componentReady",
+        apiVersion: 1
+      }, "*");
+      setFrameHeight();
+    </script>
+  </body>
+</html>

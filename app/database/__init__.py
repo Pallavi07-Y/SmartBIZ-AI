@@ -3,7 +3,7 @@ import os
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, JSON, String, create_engine
+from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, JSON, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from sqlalchemy.pool import StaticPool
 from dotenv import load_dotenv
@@ -40,6 +40,9 @@ class Business(Base):
 	owner_name: Mapped[str | None] = mapped_column(String, nullable=True)
 	category: Mapped[str | None] = mapped_column(String)
 	address: Mapped[str | None] = mapped_column(String)
+	latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+	longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+	location_precision: Mapped[str | None] = mapped_column(String, nullable=True)
 	owner_phone: Mapped[str | None] = mapped_column(String, unique=True)
 	username: Mapped[str | None] = mapped_column(String, unique=True)
 	password_hash: Mapped[str | None] = mapped_column(String)
@@ -67,6 +70,7 @@ class Conversation(Base):
 	business_id: Mapped[str] = mapped_column(ForeignKey("businesses.business_id"))
 	customer_session_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
 	customer_phone: Mapped[str | None] = mapped_column(String)
+	order_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 	status: Mapped[ConversationStatus] = mapped_column(
 		Enum(ConversationStatus),
 		default=ConversationStatus.AI_HANDLING,
@@ -117,6 +121,7 @@ class Order(Base):
 	customer_address: Mapped[str | None] = mapped_column(String, nullable=True)
 	items: Mapped[list] = mapped_column(JSON, nullable=False)
 	status: Mapped[str] = mapped_column(String, nullable=False)
+	payment_method: Mapped[str | None] = mapped_column(String, nullable=True)
 	stock_deducted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 	created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -199,6 +204,12 @@ def _ensure_schema_compatibility():
 			connection.exec_driver_sql("ALTER TABLE businesses ADD COLUMN username VARCHAR")
 		if "password_hash" not in business_columns:
 			connection.exec_driver_sql("ALTER TABLE businesses ADD COLUMN password_hash VARCHAR")
+		if "latitude" not in business_columns:
+			connection.exec_driver_sql("ALTER TABLE businesses ADD COLUMN latitude FLOAT")
+		if "longitude" not in business_columns:
+			connection.exec_driver_sql("ALTER TABLE businesses ADD COLUMN longitude FLOAT")
+		if "location_precision" not in business_columns:
+			connection.exec_driver_sql("ALTER TABLE businesses ADD COLUMN location_precision VARCHAR")
 		order_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(orders)").fetchall()}
 		if "stock_deducted" not in order_columns:
 			connection.exec_driver_sql("ALTER TABLE orders ADD COLUMN stock_deducted BOOLEAN NOT NULL DEFAULT 0")
@@ -206,9 +217,13 @@ def _ensure_schema_compatibility():
 			connection.exec_driver_sql("ALTER TABLE orders ADD COLUMN customer_session_id VARCHAR")
 		if "customer_address" not in order_columns:
 			connection.exec_driver_sql("ALTER TABLE orders ADD COLUMN customer_address VARCHAR")
+		if "payment_method" not in order_columns:
+			connection.exec_driver_sql("ALTER TABLE orders ADD COLUMN payment_method VARCHAR")
 		conversation_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(conversations)").fetchall()}
 		if "customer_session_id" not in conversation_columns:
 			connection.exec_driver_sql("ALTER TABLE conversations ADD COLUMN customer_session_id VARCHAR")
+		if "order_state" not in conversation_columns:
+			connection.exec_driver_sql("ALTER TABLE conversations ADD COLUMN order_state JSON")
 		product_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(products)").fetchall()}
 		if "low_stock_threshold" not in product_columns:
 			connection.exec_driver_sql("ALTER TABLE products ADD COLUMN low_stock_threshold INTEGER NOT NULL DEFAULT 2")

@@ -1,69 +1,9 @@
-import re
-
 from app.database import Product, get_session
 from app.rag.document_loader import DocumentLoader
 from app.rag.chunking import DocumentChunker
 
 
 class BusinessCatalog:
-
-    DEFAULT_PRODUCTS = [
-        {
-            "product_name": "Samsung Galaxy S25",
-            "brand": "Samsung",
-            "price": 75000,
-            "price_text": "₹75,000",
-            "ram": "12GB",
-            "storage": "256GB",
-            "processor": "Snapdragon 8 Elite",
-            "availability": "In Stock",
-            "category": "smartphone",
-        },
-        {
-            "product_name": "Samsung Galaxy S25 Ultra",
-            "brand": "Samsung",
-            "price": 120000,
-            "price_text": "₹1,20,000",
-            "ram": "12GB",
-            "storage": "512GB",
-            "processor": "Snapdragon 8 Elite",
-            "availability": "In Stock",
-            "category": "smartphone",
-        },
-        {
-            "product_name": "iPhone 16",
-            "brand": "Apple",
-            "price": 80000,
-            "price_text": "₹80,000",
-            "storage": "256GB",
-            "processor": "Apple A18 Chip",
-            "availability": "In Stock",
-            "category": "smartphone",
-        },
-        {
-            "product_name": "OnePlus 13",
-            "brand": "OnePlus",
-            "price": 65000,
-            "price_text": "₹65,000",
-            "ram": "12GB",
-            "storage": "256GB",
-            "processor": "Snapdragon 8 Elite",
-            "availability": "In Stock",
-            "category": "smartphone",
-        },
-        {
-            "product_name": "Nothing Phone 3",
-            "brand": "Nothing",
-            "price": 52000,
-            "price_text": "₹52,000",
-            "ram": "12GB",
-            "storage": "256GB",
-            "processor": "Snapdragon Processor",
-            "availability": "In Stock",
-            "category": "smartphone",
-        },
-    ]
-
     def __init__(self, business_id):
 
         self.business_id = business_id
@@ -87,13 +27,6 @@ class BusinessCatalog:
             else:
                 self.chunks = []
 
-            self.products = self._parse_products()
-            if not self.products:
-                self.products = [dict(product) for product in self.DEFAULT_PRODUCTS]
-                for product in self.products:
-                    product["business_id"] = self.business_id
-
-        self.faq_items = self._parse_faqs()
         self.business_info = self._parse_business_info()
 
     def _load_products_from_db(self):
@@ -179,93 +112,6 @@ class BusinessCatalog:
     def _normalize_text(self, text):
         return text.strip().replace("\r", "").replace("\n", " ").strip()
 
-    def _parse_price(self, value):
-        if not value:
-            return None
-        match = re.search(r"([0-9][0-9,]*)", value.replace("₹", ""))
-        if not match:
-            return None
-        return int(match.group(1).replace(",", ""))
-
-    def _parse_number(self, value):
-        if not value:
-            return None
-        match = re.search(r"([0-9]+)", value.replace(",", ""))
-        if not match:
-            return None
-        return int(match.group(1))
-
-    def _parse_products(self):
-        products = []
-        current = None
-        current_category = None
-
-        for document in self.documents:
-            lines = [line.strip() for line in document.page_content.splitlines()]
-
-            for line in lines:
-                if not line:
-                    continue
-
-                lower = line.lower()
-
-                if lower.startswith("category:"):
-                    current_category = line.split(":", 1)[1].strip().lower()
-                    continue
-
-                if lower.startswith("product name:"):
-                    if current:
-                        products.append(current)
-
-                    current = {
-                        "business_id": self.business_id,
-                        "category": current_category or "product"
-                    }
-                    current["product_name"] = line.split(":", 1)[1].strip()
-                    continue
-
-                if current and ":" in line:
-                    key, value = line.split(":", 1)
-                    normalized_key = key.strip().lower().replace(" ", "_")
-                    current[normalized_key] = value.strip()
-                    continue
-
-                if current and lower.startswith("----"):
-                    products.append(current)
-                    current = None
-
-            if current:
-                products.append(current)
-                current = None
-
-        unique = {}
-        for product in products:
-            name = product.get("product_name")
-            if not name:
-                continue
-            unique[name.lower()] = product
-
-        for product in unique.values():
-            product["price"] = self._parse_price(product.get("price") or product.get("price_range"))
-            product["ram_gb"] = self._parse_number(product.get("ram"))
-            product["storage_gb"] = self._parse_number(product.get("storage"))
-            product["availability"] = product.get("availability", "").strip()
-            product["brand"] = product.get("brand", "").strip()
-            product["processor"] = product.get("processor", "").strip()
-            product["price_text"] = product.get("price") and f"₹{product['price']:,}" or product.get("price_range")
-
-        return list(unique.values())
-
-    def _parse_faqs(self):
-        faqs = []
-
-        for chunk in self.chunks:
-            text = chunk.page_content.strip()
-            if chunk.metadata.get("type") == "faq" or any(term in text.lower() for term in ["q:", "a:", "do you provide", "do you offer", "can i", "how do", "what are your"]):
-                faqs.append(text)
-
-        return faqs
-
     def _parse_business_info(self):
         business_info = []
 
@@ -314,13 +160,6 @@ class BusinessCatalog:
 
         return items
 
-    def get_faqs(self, query=None):
-        if not query:
-            return self.faq_items
-
-        keywords = [term.strip().lower() for term in re.split(r"\W+", query) if term.strip()]
-        return [faq for faq in self.faq_items if all(term in faq.lower() for term in keywords)]
-
     def get_business_info_text(self):
         return "\n\n".join(self.business_info)
 
@@ -333,15 +172,6 @@ class BusinessCatalog:
         parts.append(f"Product Name: {product.get('product_name')}")
         if product.get("sku"):
             parts.append(f"SKU: {product['sku']}")
-        price_text = product.get("price_text")
-        if not price_text and product.get("price") is not None:
-            price_text = f"₹{int(product['price']):,}"
-        if price_text:
-            parts.append(f"Price: {price_text}")
-        if product.get("availability"):
-            parts.append(f"Availability: {product['availability']}")
-        if product.get("stock_quantity") is not None:
-            parts.append(f"Stock Quantity: {product['stock_quantity']}")
         for key in ["brand", "ram", "storage", "processor", "category", "description"]:
             value = product.get(key)
             if value:

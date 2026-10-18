@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 import app.database as database_module
@@ -124,3 +126,107 @@ def test_agent_returns_missing_information_without_calling_llm(isolated_agent):
     }
     assert tools.calls[-1] == ("test-business", "What is the price of a MacBook?")
     assert FakeLLM.instances[-1].messages == []
+
+
+def test_agent_lists_all_catalog_features_from_live_products(isolated_agent):
+    agent, tools = isolated_agent
+    live_products = [
+        {
+            "product_name": "Phone Alpha",
+            "brand": "Acme",
+            "category": "Smartphone",
+            "price": 42000,
+            "stock_quantity": 3,
+            "availability": "In Stock",
+            "ram_gb": 8,
+            "storage_gb": 256,
+            "processor": "Acme A1",
+            "description": "OLED display and dual rear cameras.",
+        },
+        {
+            "product_name": "Phone Beta",
+            "brand": "Acme",
+            "category": "Smartphone",
+            "price": 51000,
+            "stock_quantity": 0,
+            "availability": "Out of Stock",
+            "ram_gb": 12,
+            "storage_gb": 512,
+            "processor": "Acme B2",
+            "description": "Large battery and triple rear cameras.",
+        },
+    ]
+    captured = {}
+
+    def get_live_products(business_id, **kwargs):
+        captured["business_id"] = business_id
+        captured.update(kwargs)
+        return live_products
+
+    tools.get_live_products = get_live_products
+
+    response = agent.chat("test-business", "Tell me the features of every product they have")
+
+    assert captured == {
+        "business_id": "test-business",
+        "limit": None,
+        "available_only": False,
+    }
+    assert "Phone Alpha" in response["reply"]
+    assert "Phone Beta" in response["reply"]
+    assert "RAM: 8GB" in response["reply"]
+    assert "Storage: 512GB" in response["reply"]
+    assert "OLED display and dual rear cameras." in response["reply"]
+    assert "Out of Stock (0 in stock)" in response["reply"]
+
+
+def test_agent_recommends_from_the_selected_business_live_catalog(isolated_agent):
+    agent, tools = isolated_agent
+    live_products = [
+        {
+            "product_name": "Phone Alpha",
+            "price": 42000,
+            "stock_quantity": 3,
+            "ram_gb": 8,
+            "storage_gb": 256,
+            "processor": "Acme A1",
+            "description": "OLED display.",
+        },
+        {
+            "product_name": "Phone Beta",
+            "price": 51000,
+            "stock_quantity": 2,
+            "ram_gb": 12,
+            "storage_gb": 512,
+            "processor": "Acme B2",
+            "description": "Large battery.",
+        },
+    ]
+    captured = {}
+
+    def get_live_products(business_id, **kwargs):
+        captured["business_id"] = business_id
+        captured.update(kwargs)
+        return live_products
+
+    tools.get_live_products = get_live_products
+
+    response = agent.chat(
+        "test-business",
+        "Which is the best among the products of this company and why?",
+    )
+
+    messages = FakeLLM.instances[-1].messages[-1]
+    payload = json.loads(messages[-1]["content"])
+    assert captured == {
+        "business_id": "test-business",
+        "limit": None,
+        "available_only": True,
+    }
+    assert [product["product_name"] for product in payload["live_products_from_sqlite"]] == [
+        "Phone Alpha",
+        "Phone Beta",
+    ]
+    assert "make a clear recommendation" in messages[0]["content"]
+    assert "Phone Alpha" in response["reply"]
+    assert "Phone Beta" in response["reply"]

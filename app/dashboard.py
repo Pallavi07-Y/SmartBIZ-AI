@@ -1,6 +1,8 @@
 import json
+import re
 import secrets
 import sys
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -17,6 +19,16 @@ from app.business.analytics import get_business_metrics
 from app.business.catalog import BusinessCatalog
 from app.business.register_business import BusinessManager
 from app.business.search_business import BusinessSearch
+from app.business.nearby import (
+    LocationLookupError,
+    geocode_place,
+    reverse_geocode,
+    save_shop_coordinates,
+    save_shop_location,
+    search_nearby_shops,
+    validate_coordinates,
+)
+from app.components.location_picker import location_picker
 from app.database import (
     Business,
     OtpVerification,
@@ -41,6 +53,7 @@ from app.utils.auth import (
     verify_password,
     verify_phone_otp,
 )
+from app.utils.logger import logger
 
 
 configure_database()
@@ -125,6 +138,7 @@ def get_orders_for_business(business_id):
                 "price": next((item.get("price", 0) for item in (order.items or []) if isinstance(item, dict)), 0),
                 "total": next((item.get("price", 0) * item.get("quantity", 1) for item in (order.items or []) if isinstance(item, dict)), 0),
                 "status": str(order.status or "NEW").upper(),
+                "payment_method": order.payment_method,
                 "created_at": order.created_at,
             }
             for order in orders
@@ -147,6 +161,8 @@ def get_customer_business(business_id):
             "name": business.name,
             "category": business.category,
             "address": business.address,
+            "latitude": business.latitude,
+            "longitude": business.longitude,
             "owner_phone": business.owner_phone,
             "username": business.username,
             "created_at": business.created_at,
@@ -209,6 +225,94 @@ def get_customer_products(business_id, query=None, category=None, limit=None):
         session.close()
 
 
+def search_customer_marketplace(query, *, product_limit=250):
+    session = get_session()
+    try:
+        businesses = session.query(Business).order_by(Business.name.asc()).all()
+        shops = [
+            {
+                "business_id": business.business_id,
+                "name": business.name,
+                "category": business.category,
+                "address": business.address,
+                "latitude": business.latitude,
+                "longitude": business.longitude,
+            }
+            for business in businesses
+        ]
+    finally:
+        session.close()
+
+    products = AgentTools.__new__(AgentTools).get_marketplace_catalog(limit=product_limit)
+    terms = [
+        term for term in re.findall(r"[a-z0-9]+", (query or "").casefold())
+        if len(term) > 1 and term not in {
+            "a", "an", "and", "are", "best", "buy", "find", "for", "from", "i", "in",
+            "is", "me", "my", "of", "on", "please", "product", "products", "shop",
+            "shops", "the", "to", "want", "what", "which", "with", "you",
+        }
+    ]
+    if not terms:
+        return shops, products
+
+    def match_score(text):
+        words = set(re.findall(r"[a-z0-9]+", text.casefold()))
+        return sum(
+            any(word == term or (len(term) >= 4 and word.startswith(term)) for word in words)
+            for term in terms
+        )
+
+    shops = [
+        (match_score(" ".join(str(shop.get(key) or "") for key in ("name", "category", "address"))), shop)
+        for shop in shops
+    ]
+    shops = [shop for score, shop in shops if score]
+    shops.sort(key=lambda shop: shop["name"].casefold())
+
+    products = [
+        (
+            match_score(" ".join(str(product.get(key) or "") for key in (
+                "product_name", "brand", "category", "description",
+                "shop_name", "shop_category", "shop_address",
+            ))),
+            product,
+        )
+        for product in products
+    ]
+    products = [product for score, product in products if score]
+    products.sort(
+        key=lambda product: (
+            -match_score(" ".join(str(product.get(key) or "") for key in (
+                "product_name", "brand", "category", "description",
+                "shop_name", "shop_category", "shop_address",
+            ))),
+            product["stock_quantity"] <= 0,
+            -product["recorded_orders"],
+            product["product_name"].casefold(),
+        )
+    )
+    matched_shop_ids = {product["business_id"] for product in products}
+    for shop in shops:
+        if shop["business_id"] in matched_shop_ids:
+            matched_shop_ids.remove(shop["business_id"])
+    if matched_shop_ids:
+        session = get_session()
+        try:
+            related_shops = session.query(Business).filter(
+                Business.business_id.in_(matched_shop_ids)
+            ).all()
+            shops.extend({
+                "business_id": shop.business_id,
+                "name": shop.name,
+                "category": shop.category,
+                "address": shop.address,
+            } for shop in related_shops)
+        finally:
+            session.close()
+        shops.sort(key=lambda shop: shop["name"].casefold())
+    return shops, products
+
+
 def get_customer_orders(customer_session_id):
     if not customer_session_id:
         return []
@@ -240,6 +344,7 @@ def get_customer_orders(customer_session_id):
                 "items": items,
                 "total": total,
                 "status": str(order.status or "NEW").upper(),
+                "payment_method": order.payment_method,
                 "customer_address": order.customer_address,
                 "created_at": order.created_at,
             })
@@ -552,6 +657,21 @@ def _apply_dashboard_theme():
                 color: #E2ECE7;
             }
 
+            [data-testid="stSidebar"] h1,
+            [data-testid="stSidebar"] h2,
+            [data-testid="stSidebar"] h3,
+            [data-testid="stSidebar"] h4,
+            [data-testid="stSidebar"] h5,
+            [data-testid="stSidebar"] h6,
+            [data-testid="stSidebar"] .stMarkdown h1,
+            [data-testid="stSidebar"] .stMarkdown h2,
+            [data-testid="stSidebar"] .stMarkdown h3,
+            [data-testid="stSidebar"] .stMarkdown h4,
+            [data-testid="stSidebar"] .stMarkdown h5,
+            [data-testid="stSidebar"] .stMarkdown h6 {
+                color: #FFFFFF !important;
+            }
+
             .brand-header {
                 display: flex;
                 align-items: center;
@@ -697,6 +817,10 @@ def _apply_dashboard_theme():
                 border-radius: 16px;
                 box-shadow: 0 18px 45px rgba(22, 52, 43, 0.1);
                 padding: 2rem 1.65rem;
+            }
+
+            .auth-card:empty {
+                display: none;
             }
 
             .auth-headline {
@@ -1299,22 +1423,86 @@ def _show_signup_page():
     elif step == "details":
         st.markdown("<div class='auth-headline'>Business Details</div>", unsafe_allow_html=True)
         st.markdown("<div class='auth-subtitle'>Step 3 of 4</div>", unsafe_allow_html=True)
+        signup_location = location_picker(
+            key="signup_shop_location_picker",
+            button_label="Use My Current Location",
+        )
+        if isinstance(signup_location, dict):
+            request_id = signup_location.get("request_id")
+            if request_id and request_id != st.session_state.get("signup_location_request_id"):
+                st.session_state.signup_location_request_id = request_id
+                if signup_location.get("status") == "success":
+                    try:
+                        latitude, longitude = validate_coordinates(
+                            signup_location.get("latitude"),
+                            signup_location.get("longitude"),
+                        )
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.session_state.signup_latitude = str(latitude)
+                        st.session_state.signup_longitude = str(longitude)
+                        st.success("Current location captured. Confirm the shop address before continuing.")
+                else:
+                    st.warning(
+                        signup_location.get("message")
+                        or "Location permission was not available. Enter the shop coordinates manually."
+                    )
         with st.form("shop_details_form"):
-            owner_name = st.text_input("Owner Name")
-            shop_name = st.text_input("Shop Name")
-            category = st.text_input("Business Category")
-            address = st.text_area("Shop Address")
+            owner_name = st.text_input(
+                "Owner Name",
+                value=st.session_state.get("signup_owner_name", ""),
+            )
+            shop_name = st.text_input(
+                "Shop Name",
+                value=st.session_state.get("signup_shop_name", ""),
+            )
+            category = st.text_input(
+                "Business Category",
+                value=st.session_state.get("signup_category", ""),
+            )
+            address = st.text_area(
+                "Shop Address",
+                value=st.session_state.get("signup_address", ""),
+            )
+            coordinate_columns = st.columns(2)
+            latitude = coordinate_columns[0].text_input(
+                "Shop Latitude (optional)",
+                value=st.session_state.get("signup_latitude", ""),
+            )
+            longitude = coordinate_columns[1].text_input(
+                "Shop Longitude (optional)",
+                value=st.session_state.get("signup_longitude", ""),
+            )
             submitted = st.form_submit_button("CONTINUE", use_container_width=True)
         if submitted:
             if not all([owner_name.strip(), shop_name.strip(), category.strip(), address.strip()]):
                 st.error("Please complete all business details.")
             else:
-                st.session_state.signup_owner_name = owner_name.strip()
-                st.session_state.signup_shop_name = shop_name.strip()
-                st.session_state.signup_category = category.strip()
-                st.session_state.signup_address = address.strip()
-                st.session_state.signup_step = "password"
-                st.rerun()
+                latitude_missing = not latitude.strip()
+                longitude_missing = not longitude.strip()
+                coordinates_valid = True
+                if latitude_missing != longitude_missing:
+                    st.error("Enter both shop coordinates, or leave both blank.")
+                    coordinates_valid = False
+                else:
+                    if latitude_missing:
+                        latitude = longitude = None
+                    else:
+                        try:
+                            latitude, longitude = validate_coordinates(latitude, longitude)
+                        except ValueError as exc:
+                            st.error(str(exc))
+                            coordinates_valid = False
+                if coordinates_valid:
+                    st.session_state.signup_owner_name = owner_name.strip()
+                    st.session_state.signup_shop_name = shop_name.strip()
+                    st.session_state.signup_category = category.strip()
+                    st.session_state.signup_address = address.strip()
+                    st.session_state.signup_latitude = latitude
+                    st.session_state.signup_longitude = longitude
+                    st.session_state.signup_step = "password"
+                    st.rerun()
 
     elif step == "password":
         st.markdown("<div class='auth-headline'>Create Password</div>", unsafe_allow_html=True)
@@ -1355,6 +1543,8 @@ def _show_signup_page():
                         username=f"shop-{normalize_phone(st.session_state.signup_phone)}",
                         password_hash=hash_password(password),
                         owner_name=st.session_state.signup_owner_name,
+                        latitude=st.session_state.get("signup_latitude"),
+                        longitude=st.session_state.get("signup_longitude"),
                     )
                     st.session_state.role = "shopkeeper"
                     st.session_state.auth_mode = "signup"
@@ -1495,6 +1685,10 @@ def _logout():
     st.rerun()
 
 
+def _sync_dashboard_page(widget_key):
+    st.session_state.dashboard_page = st.session_state[widget_key]
+
+
 def _render_orders_page():
     business_id = st.session_state.get("business_id")
     metrics = get_business_metrics(business_id)
@@ -1529,6 +1723,7 @@ def _render_orders_page():
             "Quantity": order["quantity"],
             "Unit Price": f"₹{first_item.get('price', 0):,}" if first_item else "-",
             "Total": f"₹{order['total']:,}",
+            "Payment": order.get("payment_method") or "Not recorded",
             "Requested Delivery": "Not specified",
             "Status": order["status"],
             "Order Time": order["created_at"].strftime("%d %b %Y, %I:%M %p") if order["created_at"] else "-",
@@ -1567,7 +1762,7 @@ def _render_products_page():
     catalog = BusinessCatalog(business_id)
     products = controller.list_products(business_id, include_inactive=True)
 
-    st.markdown("<div class='section-heading'>Product Management</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-heading'>Products &amp; Stock</div>", unsafe_allow_html=True)
     col_1, col_2, col_3 = st.columns(3)
     with col_1:
         st.markdown(f"<div class='metric-card'><div class='metric-label'>Products</div><div class='metric-value'>{len(products)}</div><div class='metric-accent'>Catalog</div></div>", unsafe_allow_html=True)
@@ -1600,7 +1795,10 @@ def _render_products_page():
             stock_quantity = st.number_input("Stock quantity", min_value=0, value=0, step=1)
             low_stock_threshold = st.number_input("Low-stock threshold", min_value=0, value=2, step=1)
             availability = st.text_input("Availability", placeholder="In Stock")
-            description = st.text_area("Description", height=80)
+            ram_gb = st.number_input("RAM (GB, if applicable)", min_value=0, value=0, step=1)
+            storage_gb = st.number_input("Storage (GB, if applicable)", min_value=0, value=0, step=1)
+            processor = st.text_input("Processor / key specification")
+            description = st.text_area("Features / description", height=100)
         submitted = st.form_submit_button("Save Product")
 
     if submitted:
@@ -1617,6 +1815,9 @@ def _render_products_page():
                 sku=sku.strip() or None,
                 description=description.strip() or None,
                 availability=availability.strip() or None,
+                ram_gb=int(ram_gb) if ram_gb else None,
+                storage_gb=int(storage_gb) if storage_gb else None,
+                processor=processor.strip() or None,
                 low_stock_threshold=int(low_stock_threshold),
             )
             catalog.sync_products_to_rag()
@@ -1658,6 +1859,59 @@ def _render_products_page():
                     catalog.sync_products_to_rag()
                     st.success(f"Updated {product.get('product_name')}.")
                     st.rerun()
+            with st.expander("Edit product features and specifications"):
+                with st.form(f"update_product_details_{product.get('id')}"):
+                    detail_columns = st.columns(2)
+                    with detail_columns[0]:
+                        updated_brand = st.text_input(
+                            "Brand",
+                            value=product.get("brand") or "",
+                            key=f"brand_{product.get('id')}",
+                        )
+                        updated_ram_gb = st.number_input(
+                            "RAM (GB, if applicable)",
+                            min_value=0,
+                            value=int(product.get("ram_gb") or 0),
+                            key=f"ram_{product.get('id')}",
+                        )
+                        updated_processor = st.text_input(
+                            "Processor / key specification",
+                            value=product.get("processor") or "",
+                            key=f"processor_{product.get('id')}",
+                        )
+                    with detail_columns[1]:
+                        updated_category = st.text_input(
+                            "Category",
+                            value=product.get("category") or "",
+                            key=f"category_{product.get('id')}",
+                        )
+                        updated_storage_gb = st.number_input(
+                            "Storage (GB, if applicable)",
+                            min_value=0,
+                            value=int(product.get("storage_gb") or 0),
+                            key=f"storage_{product.get('id')}",
+                        )
+                    updated_description = st.text_area(
+                        "Features / description",
+                        value=product.get("description") or "",
+                        key=f"description_{product.get('id')}",
+                        height=100,
+                    )
+                    details_saved = st.form_submit_button("Save product details")
+                if details_saved:
+                    controller.update_product(
+                        business_id,
+                        product["id"],
+                        brand=updated_brand.strip() or None,
+                        category=updated_category.strip() or None,
+                        ram_gb=int(updated_ram_gb) if updated_ram_gb else None,
+                        storage_gb=int(updated_storage_gb) if updated_storage_gb else None,
+                        processor=updated_processor.strip() or None,
+                        description=updated_description.strip() or None,
+                    )
+                    catalog.sync_products_to_rag()
+                    st.success(f"Features updated for {product.get('product_name')}.")
+                    st.rerun()
             if st.button(f"Deactivate product", key=f"deactivate_{product.get('id')}"):
                 controller.deactivate_product(business_id, product["id"])
                 catalog.sync_products_to_rag()
@@ -1674,29 +1928,33 @@ def _render_knowledge_base_page():
     controller = BusinessController()
     documents = controller.list_knowledge_documents(business_id)
 
-    st.markdown("<div class='section-heading'>Knowledge Base</div>", unsafe_allow_html=True)
-    st.markdown("<div class='hero-subtitle'>Upload business documents, product notes, or service FAQs to keep the AI context fresh.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-heading'>Shop Knowledge</div>", unsafe_allow_html=True)
+    st.markdown("<div class='hero-subtitle'>Upload this shop's documents so the AI can answer from your policies, product notes, and service information.</div>", unsafe_allow_html=True)
 
     with st.form("knowledge_upload_form"):
-        file = st.file_uploader("Upload document", type=["txt", "pdf", "csv", "docx"])
+        file = st.file_uploader(
+            "Upload shop document",
+            type=["pdf", "docx", "txt", "jpg", "jpeg", "png", "csv"],
+            help="Images are sent to the configured vision model to extract text before indexing.",
+        )
         submitted = st.form_submit_button("Upload and index")
 
     if submitted and file is not None:
-        temp_dir = Path("data/temp_uploads")
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        temp_path = temp_dir / file.name
-        temp_path.write_bytes(file.getvalue())
-        try:
-            result = controller.add_document(business_id, str(temp_path))
-            st.success(f"Indexed {file.name} successfully.")
-            st.caption(f"Documents added: {result.get('documents_added')}")
-            st.session_state.last_doc_result = result
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Unable to index the document: {exc}")
-        finally:
-            if temp_path.exists():
-                temp_path.unlink(missing_ok=True)
+        safe_name = Path(file.name.replace("\\", "/")).name
+        if not safe_name:
+            st.error("The uploaded file must have a name.")
+        else:
+            with tempfile.TemporaryDirectory(prefix="smartbiz-knowledge-") as temp_dir:
+                temp_path = Path(temp_dir) / safe_name
+                temp_path.write_bytes(file.getvalue())
+                try:
+                    result = controller.add_document(business_id, str(temp_path))
+                    st.success(f"Indexed {safe_name} successfully.")
+                    st.caption(f"Documents added: {result.get('documents_added')}")
+                    st.session_state.last_doc_result = result
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Unable to index the document: {exc}")
 
     if not documents:
         st.info("No knowledge-base documents have been uploaded yet.")
@@ -1739,7 +1997,78 @@ def _render_profile_page():
         profile_columns[1].text_input("Phone", value=business.owner_phone or "", disabled=True)
         profile_columns = st.columns(2)
         profile_columns[0].text_input("Category", value=business.category or "", disabled=True)
-        profile_columns[1].text_input("Address", value=business.address or "", disabled=True)
+        st.subheader("Shop location for nearby discovery")
+        st.caption(
+            "While on-site, use your device location or enter the shop's exact coordinates and address. "
+            "Existing geocoded locations are based on the saved town/city address and may be approximate. "
+            "Save the shop's exact location here to replace an approximate pin."
+        )
+        shop_location_result = location_picker(
+            key=f"shop_location_picker_{business_id}",
+            button_label="Use My Current Location",
+        )
+        if isinstance(shop_location_result, dict):
+            request_id = shop_location_result.get("request_id")
+            if (
+                request_id
+                and request_id != st.session_state.get("shop_location_request_id")
+            ):
+                st.session_state.shop_location_request_id = request_id
+                if shop_location_result.get("status") == "success":
+                    try:
+                        shop_latitude, shop_longitude = validate_coordinates(
+                            shop_location_result.get("latitude"),
+                            shop_location_result.get("longitude"),
+                        )
+                        save_shop_coordinates(
+                            business_id,
+                            shop_latitude,
+                            shop_longitude,
+                        )
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    except Exception:
+                        logger.exception(
+                            "Unable to save shop coordinates for business %s",
+                            business_id,
+                        )
+                        st.error("Unable to save the shop location. Please try again.")
+                    else:
+                        st.success("Shop location saved from this device.")
+                        st.rerun()
+                else:
+                    st.warning(
+                        shop_location_result.get("message")
+                        or "Unable to get this device's location."
+                    )
+        with st.form("shop_location_form"):
+            address = st.text_area(
+                "Shop Address",
+                value=business.address or "",
+            )
+            coordinate_columns = st.columns(2)
+            latitude = coordinate_columns[0].text_input(
+                "Latitude",
+                value="" if business.latitude is None else str(business.latitude),
+                placeholder="e.g. 13.6288",
+            )
+            longitude = coordinate_columns[1].text_input(
+                "Longitude",
+                value="" if business.longitude is None else str(business.longitude),
+                placeholder="e.g. 79.4192",
+            )
+            save_location = st.form_submit_button("Save address and location")
+        if save_location:
+            try:
+                save_shop_location(business_id, address, latitude, longitude)
+            except ValueError as exc:
+                st.error(str(exc))
+            except Exception:
+                logger.exception("Unable to save shop coordinates for business %s", business_id)
+                st.error("Unable to save the shop location. Please try again.")
+            else:
+                st.success("Shop address and location saved.")
+                st.rerun()
 
         st.subheader("Account")
         with st.form("change_password_form"):
@@ -1764,7 +2093,7 @@ def _render_profile_page():
         if st.button("Log Out", type="secondary"):
             _logout()
 
-        st.subheader("AI and Knowledge Base")
+        st.subheader("AI Business Hub")
         document_count = session.query(KnowledgeDocument).filter(KnowledgeDocument.business_id == business_id).count()
         latest_document = (
             session.query(KnowledgeDocument)
@@ -1936,24 +2265,50 @@ def _render_notifications_page():
     if selected_type != "All":
         notifications = [notification for notification in notifications if notification.get("type") == selected_type]
 
-    route_by_reference = {"ORDER": "🛒 Orders", "CONVERSATION": "💬 Customer Chats", "PRODUCT": "📦 Products"}
-    for index, notification in enumerate(notifications):
-        color = "#D7F4E6" if notification.get("is_read") else "#FDECEC"
-        columns = st.columns([5, 1, 1])
-        with columns[0]:
-            st.markdown(
-                f"<div style='background:{color};border:1px solid #E5E7EB;border-radius:10px;padding:0.9rem;margin-bottom:0.6rem;'>"
-                f"<strong>{notification.get('title')}</strong><br><span style='color:#6B7280;'>{notification.get('message')}</span></div>",
-                unsafe_allow_html=True,
+    notification_ids = [item["notification_id"] for item in notifications]
+    selected_id = st.session_state.get("selected_notification_id")
+    if selected_id not in notification_ids:
+        selected_id = notification_ids[0]
+        st.session_state.selected_notification_id = selected_id
+    selected_notification = next(
+        item for item in notifications if item["notification_id"] == selected_id
+    )
+
+    list_column, detail_column = st.columns([1, 1.7], gap="large")
+    with list_column:
+        st.subheader("Inbox")
+        for notification in notifications:
+            unread_marker = " • New" if not notification.get("is_read") else ""
+            if st.button(
+                f"{notification.get('title') or 'Notification'}{unread_marker}",
+                key=f"notification_select_{notification['notification_id']}",
+                type="primary" if notification["notification_id"] == selected_id else "secondary",
+                width="stretch",
+            ):
+                st.session_state.selected_notification_id = notification["notification_id"]
+                st.rerun()
+            st.caption(notification.get("message") or "")
+
+    with detail_column:
+        st.subheader(selected_notification.get("title") or "Notification")
+        st.write(selected_notification.get("message") or "")
+        created_at = selected_notification.get("created_at")
+        if created_at:
+            st.caption(created_at.strftime("%d %b %Y, %I:%M %p"))
+        reference_type = selected_notification.get("reference_type")
+        reference_id = selected_notification.get("reference_id")
+        if reference_type:
+            st.caption(
+                f"Related to {reference_type.lower()}"
+                + (f" · {reference_id}" if reference_id else "")
             )
-        if not notification.get("is_read") and columns[1].button("Mark read", key=f"notification_read_{index}"):
-            mark_notification_as_read(business_id, notification["notification_id"])
-            st.rerun()
-        destination = route_by_reference.get(notification.get("reference_type"))
-        if destination and columns[2].button("Open", key=f"notification_open_{index}"):
-            st.session_state.requested_dashboard_page = destination
-            if not notification.get("is_read"):
-                mark_notification_as_read(business_id, notification["notification_id"])
+        if selected_notification.get("is_read"):
+            st.caption("Read")
+        elif st.button(
+            "Mark as read",
+            key=f"notification_read_{selected_notification['notification_id']}",
+        ):
+            mark_notification_as_read(business_id, selected_notification["notification_id"])
             st.rerun()
 
 
@@ -1964,7 +2319,7 @@ def _render_ai_business_insights_page():
         return
 
     metrics = get_business_metrics(business_id)
-    st.title("AI Business Insights")
+    st.subheader("AI Insights")
     st.caption("Live figures below are calculated from SQLite. AI explanations are generated only when requested.")
     columns = st.columns(4)
     columns[0].metric("Revenue", f"₹{metrics['revenue']:,}")
@@ -2007,70 +2362,368 @@ def _render_ai_business_insights_page():
                 st.caption("Insufficient data to generate this insight.")
 
 
-def _render_customer_business_selection(customer_session_id):
-    st.title("Discover Shops")
-    st.caption("Explore shops, products and get assistance from AI.")
-    st.subheader("Available Shops")
+def _render_shop_ai_chat():
+    business_id = st.session_state.get("business_id")
+    if not business_id:
+        st.warning("Please log in to use the shop AI assistant.")
+        return
 
-    session = get_session()
+    st.subheader("AI Chat")
+    st.caption("Ask about this shop's indexed documents, active products, orders, or inventory.")
+    chats_by_business = st.session_state.setdefault("shop_ai_chats_by_business", {})
+    history = chats_by_business.setdefault(business_id, [])
+    for item in history:
+        with st.chat_message(item["role"]):
+            st.markdown(item["content"])
+
+    question = st.chat_input("Ask a question about your shop")
+    if not question:
+        return
+
+    history.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
     try:
-        businesses = session.query(Business).order_by(Business.name.asc()).all()
-        business_rows = [
-            {"business_id": business.business_id, "name": business.name, "category": business.category, "address": business.address}
-            for business in businesses
-        ]
-    finally:
-        session.close()
-
-    if not business_rows:
-        st.info("No shops available.")
-        return
-
-    categories = ["All"] + sorted({row["category"] for row in business_rows if row["category"]})
-    filters = st.columns([2, 1])
-    search_text = filters[0].text_input("Search shops", placeholder="Shop name or category")
-    selected_category = filters[1].selectbox("Category", categories)
-    matching = [
-        business for business in business_rows
-        if (selected_category == "All" or business["category"] == selected_category)
-        and (not search_text or search_text.casefold() in f"{business['name']} {business['category'] or ''}".casefold())
-    ]
-    if not matching:
-        st.info("No shops available for this search.")
-        return
-
-    for start in range(0, len(matching), 2):
-        columns = st.columns(2, gap="large")
-        for column, business in zip(columns, matching[start:start + 2]):
-            business_id = business["business_id"]
-            products = get_customer_products(business_id, limit=100)
+        with st.spinner("Checking this shop's knowledge and live records..."):
+            tools = AgentTools()
+            knowledge_context = tools.get_business_context(business_id, question)
+            products = tools.get_live_products(business_id, limit=100)
             metrics = get_business_metrics(business_id)
-            ordered_names = {item["product_name"] for item in metrics["top_products"]}
-            highlights = [
-                f"{product['product_name']} · Frequently ordered"
-                if product["product_name"] in ordered_names
-                else f"{product['product_name']} · Currently available"
-                for product in products[:2]
-            ]
-            with column.container(border=True, key=f"customer-shop-card-{business_id}"):
-                st.subheader(business["name"])
-                st.caption(f"{business['category'] or 'General'} · {business['address'] or 'Address not provided'}")
-                st.caption(f"{len(products)} listed product(s) · Available shop")
-                if highlights:
-                    st.markdown("**AI Shop Highlights**")
-                    for highlight in highlights:
-                        st.write(f"- {highlight}")
+            business_data = {
+                key: metrics[key]
+                for key in (
+                    "total_orders",
+                    "today_orders",
+                    "month_orders",
+                    "revenue",
+                    "average_order_value",
+                    "pending_orders",
+                    "completed_orders",
+                    "total_products",
+                    "total_units",
+                    "low_stock_products",
+                    "out_of_stock_products",
+                    "stock_value",
+                    "customer_count",
+                    "conversation_count",
+                    "escalated_count",
+                )
+            }
+            payload = json.dumps(
+                {
+                    "shop_knowledge": knowledge_context or "No relevant uploaded knowledge found.",
+                    "active_products_from_this_shop_sqlite": products,
+                    "verified_metrics_from_this_shop_sqlite": business_data,
+                },
+                default=str,
+            )
+            response = LLM().generate_response(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are the private SmartBiz assistant for the currently authenticated shopkeeper. "
+                            "Answer using only the supplied shop knowledge, active product catalog, and verified "
+                            "SQLite metrics. The supplied data belongs only to this shop; do not claim access to "
+                            "other shops or invent facts. SQLite values are authoritative for current product "
+                            "prices, stock, availability, order totals, order status, and metrics; ignore such "
+                            "values in retrieved documents. If the supplied evidence does not answer the question, "
+                            "say what is missing. Do not place orders, change records, or expose customer personal "
+                            "information. Be concise and practical."
+                        ),
+                    },
+                    *[
+                        {"role": item["role"], "content": item["content"]}
+                        for item in history[-11:-1]
+                    ],
+                    {
+                        "role": "user",
+                        "content": f"Question: {question}\n\nShop-only evidence:\n{payload}",
+                    },
+                ],
+                temperature=0.2,
+                max_tokens=900,
+            )
+        if not response or response.startswith("Sorry, something went wrong"):
+            raise RuntimeError("The configured LLM could not generate a response.")
+    except Exception:
+        logger.exception("Shopkeeper AI chat failed for business %s", business_id)
+        history.pop()
+        st.error("I couldn't get an AI response. Check the AI provider settings and try again.")
+        return
+
+    history.append({"role": "assistant", "content": response})
+    chats_by_business[business_id] = history[-12:]
+    st.session_state.shop_ai_chats_by_business = chats_by_business
+    with st.chat_message("assistant"):
+        st.markdown(response)
+
+
+def _render_ai_business_hub_page():
+    st.title("AI Business Hub")
+    st.caption("Shop knowledge and AI tools for your business.")
+    knowledge_tab, insights_tab, chat_tab = st.tabs(
+        ["Shop Knowledge", "AI Insights", "AI Chat"]
+    )
+    with knowledge_tab:
+        _render_knowledge_base_page()
+    with insights_tab:
+        _render_ai_business_insights_page()
+    with chat_tab:
+        _render_shop_ai_chat()
+
+
+def _render_customer_dashboard():
+    st.title("Find Shops & Products")
+    st.caption("Search across all shops and active product listings.")
+    _render_nearby_shop_discovery()
+    search_text = st.text_input(
+        "Search shops or products",
+        placeholder="Try a product, brand, category, shop, or location",
+        key="customer_marketplace_search",
+    ).strip()
+    shops, products = search_customer_marketplace(search_text)
+
+    if search_text:
+        st.subheader(f"Matching shops ({len(shops)})")
+        if not shops:
+            st.caption("No shop name, category, or location matched that search.")
+        for start in range(0, len(shops), 2):
+            columns = st.columns(2, gap="large")
+            for column, shop in zip(columns, shops[start:start + 2]):
+                with column.container(border=True):
+                    st.markdown(f"### {shop['name']}")
+                    st.caption(f"{shop.get('category') or 'General'} · {shop.get('address') or 'Address not listed'}")
+                    if st.button("Open shop", key=f"marketplace_shop_{shop['business_id']}"):
+                        st.session_state.customer_business_id = shop["business_id"]
+                        st.session_state.customer_shop_detail = True
+                        st.session_state.requested_customer_page = "Dashboard"
+                        st.rerun()
+
+        st.subheader(f"Matching products ({len(products)})")
+        if not products:
+            st.caption("No active product listing matched that search.")
+        for start in range(0, len(products), 2):
+            columns = st.columns(2, gap="large")
+            for column, product in zip(columns, products[start:start + 2]):
+                with column.container(border=True):
+                    st.markdown(f"### {product['product_name']}")
+                    st.caption(f"{product.get('brand') or 'Brand not listed'} · {product.get('category') or 'General'}")
+                    st.write(f"**Shop:** {product['shop_name']}")
+                    price = f"₹{product['price']:,}" if product.get("price") is not None else "Price not listed"
+                    stock = (
+                        f"In stock ({product['stock_quantity']})"
+                        if product["stock_quantity"] > 0
+                        else "Out of stock"
+                    )
+                    st.write(f"{price} · {stock}")
+                    if st.button("Browse this shop", key=f"marketplace_product_{product['id']}"):
+                        st.session_state.customer_business_id = product["business_id"]
+                        st.session_state.customer_shop_detail = True
+                        st.session_state.requested_customer_page = "Dashboard"
+                        st.rerun()
+    else:
+        st.subheader("Explore shops")
+        if not shops:
+            st.info("No shops are listed yet.")
+            return
+        for start in range(0, len(shops), 2):
+            columns = st.columns(2, gap="large")
+            for column, shop in zip(columns, shops[start:start + 2]):
+                with column.container(border=True):
+                    st.markdown(f"### {shop['name']}")
+                    st.caption(f"{shop.get('category') or 'General'} · {shop.get('address') or 'Address not listed'}")
+                    if st.button("Open shop", key=f"marketplace_shop_{shop['business_id']}"):
+                        st.session_state.customer_business_id = shop["business_id"]
+                        st.session_state.customer_shop_detail = True
+                        st.session_state.requested_customer_page = "Dashboard"
+                        st.rerun()
+
+
+def _render_nearby_shop_discovery():
+    st.subheader("Find shops near you")
+    st.caption("Choose live location or enter a town or postal code to find registered shops.")
+    st.caption(
+        "If you continue with either location option, the selected GPS coordinates or town "
+        "will be sent to OpenStreetMap to identify the area. Shop coordinates are set by each "
+        "shopkeeper; shops without them are never assigned guessed distances."
+    )
+    st.caption("Location data © OpenStreetMap contributors.")
+
+    location_result = location_picker(key="customer_nearby_location_picker")
+    if isinstance(location_result, dict):
+        request_id = location_result.get("request_id")
+        if request_id and request_id != st.session_state.get("customer_nearby_request_id"):
+            st.session_state.customer_nearby_request_id = request_id
+            if location_result.get("status") == "success":
+                try:
+                    latitude, longitude = validate_coordinates(
+                        location_result.get("latitude"),
+                        location_result.get("longitude"),
+                    )
+                except ValueError as exc:
+                    st.session_state.pop("customer_nearby_location", None)
+                    st.session_state.customer_nearby_location_error = str(exc)
                 else:
-                    st.caption("No products are currently listed.")
-                if st.button("Visit Shop", key=f"visit_shop_{business_id}", use_container_width=True):
-                    st.session_state.customer_business_id = business_id
-                    st.session_state.customer_pending_question = None
-                    st.session_state.requested_customer_page = "Dashboard"
-                    st.rerun()
+                    label = "Your location"
+                    error = None
+                    try:
+                        label = reverse_geocode(latitude, longitude)
+                    except LocationLookupError as exc:
+                        error = str(exc)
+                    st.session_state.customer_nearby_location = {
+                        "latitude": latitude,
+                        "longitude": longitude,
+                        "label": label,
+                    }
+                    st.session_state.customer_nearby_location_error = error
+            else:
+                st.session_state.pop("customer_nearby_location", None)
+                st.session_state.customer_nearby_location_error = (
+                    location_result.get("message")
+                    or "Unable to get your location. Enter a town to search manually."
+                )
+            st.rerun()
+
+    with st.form("customer_manual_location_form"):
+        manual_location = st.text_input(
+            "Enter town, city, or postal code",
+            placeholder="For example, Madanapalle",
+            key="customer_manual_location_query",
+        )
+        search_location = st.form_submit_button("Search this location")
+
+    if search_location:
+        query = manual_location.strip()
+        if not query:
+            st.warning("Enter a town, city, or postal code.")
+        else:
+            try:
+                resolved = geocode_place(query)
+            except LocationLookupError as exc:
+                st.session_state.customer_nearby_location = {
+                    "latitude": None,
+                    "longitude": None,
+                    "label": query,
+                }
+                st.session_state.customer_nearby_location_error = (
+                    f"{exc} Showing registered shops whose saved address matches your search; "
+                    "distance cannot be calculated."
+                )
+            else:
+                st.session_state.customer_nearby_location = resolved
+                st.session_state.customer_nearby_location_error = None
+            st.rerun()
+
+    location = st.session_state.get("customer_nearby_location")
+    location_error = st.session_state.get("customer_nearby_location_error")
+    if location_error:
+        st.warning(location_error)
+    if not location:
+        return
+
+    label = location["label"]
+    has_search_coordinates = (
+        location["latitude"] is not None and location["longitude"] is not None
+    )
+    if has_search_coordinates:
+        st.markdown(f"**Nearby registered shops · {label} · within 50 km**")
+        results = search_nearby_shops(
+            location["latitude"],
+            location["longitude"],
+        )
+    else:
+        st.markdown(f"**Registered shops matching {label}**")
+        results = search_nearby_shops(location_query=label)
+
+    nearby_shops = results["nearby_shops"]
+    outside_shops = results["outside_radius_shops"]
+    missing_shops = results["missing_coordinate_shops"]
+
+    def render_shop_cards(shops):
+        for start in range(0, len(shops), 2):
+            columns = st.columns(2, gap="large")
+            for column, shop in zip(columns, shops[start:start + 2]):
+                with column.container(border=True):
+                    st.markdown(f"### {shop['name']}")
+                    st.caption(
+                        f"{shop.get('category') or 'General'} · "
+                        f"{shop.get('address') or 'Address not listed'}"
+                    )
+                    if shop["location_status"] == "outside_radius":
+                        st.warning(
+                            f"Outside the {results['radius_km']} km search radius"
+                            + (
+                                f" · {shop['distance_km']:.1f} km away"
+                                if shop["distance_km"] is not None
+                                else ""
+                            )
+                        )
+                    elif shop["location_status"] == "missing_coordinates":
+                        st.info("Shop coordinates have not been added.")
+                    elif shop["distance_km"] is not None:
+                        if shop.get("location_precision") != "shop":
+                            st.write(
+                                f"**Approximate town-center distance:** "
+                                f"{shop['distance_km']:.1f} km"
+                            )
+                        else:
+                            st.write(f"**Distance:** {shop['distance_km']:.1f} km")
+                    if shop["products"]:
+                        st.write("**Products**")
+                        for product in shop["products"]:
+                            price = (
+                                f"₹{product['price']:,}"
+                                if product["price"] is not None
+                                else "Price not listed"
+                            )
+                            stock = (
+                                f"In stock ({product['stock_quantity']})"
+                                if product["stock_quantity"] > 0
+                                else "Out of stock"
+                            )
+                            st.write(f"- {product['product_name']} · {price} · {stock}")
+                    else:
+                        st.caption("No active products are listed for this shop.")
+                    if st.button(
+                        "Open shop",
+                        key=f"nearby_shop_{shop['business_id']}",
+                    ):
+                        st.session_state.customer_business_id = shop["business_id"]
+                        st.session_state.customer_shop_detail = True
+                        st.session_state.requested_customer_page = "Dashboard"
+                        st.rerun()
+
+    if nearby_shops:
+        st.subheader(
+            "Shops matching this town"
+            if not has_search_coordinates
+            else "Shops within 50 km"
+        )
+        render_shop_cards(nearby_shops)
+    if outside_shops:
+        with st.expander(f"Outside the 50 km radius ({len(outside_shops)})"):
+            st.caption("These registered shops match the town, but are outside the nearby radius.")
+            render_shop_cards(outside_shops)
+    if missing_shops:
+        with st.expander(f"Missing shop coordinates ({len(missing_shops)})"):
+            st.caption(
+                "These registered shops match the town but cannot be distance-ranked yet. "
+                "Shopkeepers can add real coordinates in Settings."
+            )
+            render_shop_cards(missing_shops)
+    if not nearby_shops and not outside_shops and not missing_shops:
+        st.info("No registered shops with matching location details were found.")
 
 
 def _render_customer_shop_page(customer_session_id, business):
     business_id = business["business_id"]
+    if st.button("Back to marketplace", key="customer_shop_back_to_marketplace"):
+        st.session_state.customer_shop_detail = False
+        st.session_state.requested_customer_page = "Dashboard"
+        st.rerun()
+
     st.title(business["name"])
     st.caption(f"{business.get('category') or 'Shop'} · {business.get('address') or 'Address not provided'}")
 
@@ -2161,6 +2814,7 @@ def _render_customer_shop_page(customer_session_id, business):
             customer_name = st.text_input("Your name", value=st.session_state.get("customer_name", ""))
             customer_phone = st.text_input("Phone number", value=st.session_state.get("customer_phone", ""))
             customer_address = st.text_area("Delivery address", value=st.session_state.get("customer_address", ""))
+            payment_method = st.selectbox("Payment method", ["COD", "EMI"])
             confirm_order = st.checkbox("I confirm these order details.")
             submit_order = st.form_submit_button("Place Order", type="primary")
         if submit_order:
@@ -2183,6 +2837,8 @@ def _render_customer_shop_page(customer_session_id, business):
                         quantity=item.get("quantity", 1),
                         customer_session_id=customer_session_id,
                         customer_address=customer_address.strip(),
+                        payment_method=payment_method,
+                        confirmed=True,
                     )
                     if order.get("error"):
                         failures.append(f"{item['product_name']}: {order['error']}")
@@ -2216,7 +2872,7 @@ def _render_customer_orders_page(customer_session_id):
             columns = st.columns(3)
             columns[0].metric("Total", f"₹{order['total']:,}")
             columns[1].metric("Status", order["status"])
-            columns[2].write(f"Requested delivery: Not specified")
+            columns[2].write(f"Payment: {order.get('payment_method') or 'Not recorded'}")
             if order.get("customer_address"):
                 st.caption(f"Delivery address: {order['customer_address']}")
 
@@ -2226,9 +2882,37 @@ def _render_customer_settings(customer_session_id, business):
     st.subheader("Current Session")
     st.code(customer_session_id[:8] + "..." if len(customer_session_id) > 12 else customer_session_id)
     st.write(f"Current shop: {business['name'] if business else 'None selected'}")
+    st.subheader("Contact details")
+    with st.form("customer_contact_details_form"):
+        customer_name = st.text_input(
+            "Your name",
+            value=st.session_state.get("customer_name", ""),
+            key="customer_profile_name_input",
+        )
+        customer_phone = st.text_input(
+            "Phone number",
+            value=st.session_state.get("customer_phone", ""),
+            key="customer_profile_phone_input",
+        )
+        customer_address = st.text_area(
+            "Delivery address",
+            value=st.session_state.get("customer_address", ""),
+            key="customer_profile_address_input",
+        )
+        save_contact_details = st.form_submit_button("Save contact details")
+    if save_contact_details:
+        normalized_phone = normalize_phone(customer_phone)
+        if normalized_phone and not 10 <= len(normalized_phone) <= 13:
+            st.error("Enter a valid phone number with 10 to 13 digits.")
+        else:
+            st.session_state.customer_name = customer_name.strip()
+            st.session_state.customer_phone = customer_phone.strip()
+            st.session_state.customer_address = customer_address.strip()
+            st.success("Contact details saved for this customer session.")
     if business and st.button("Leave Current Shop"):
         st.session_state.customer_business_id = None
-        st.session_state.requested_customer_page = "Shops"
+        st.session_state.customer_shop_detail = False
+        st.session_state.requested_customer_page = "Dashboard"
         st.rerun()
     st.subheader("Preferences")
     st.caption("Chat history is separated by shop and this browser session.")
@@ -2241,7 +2925,63 @@ def _render_customer_settings(customer_session_id, business):
     st.caption("SmartBiz AI · Business Automation System")
 
 
+def _render_customer_marketplace_assistant(customer_session_id):
+    st.title("AI Shopping Assistant")
+    st.caption("Ask questions or compare current products and shops using live listings.")
+    st.info(
+        "I can compare listed products, prices, stock, locations, and recorded orders. "
+        "Customer reviews and ratings are not collected, so I won't invent them."
+    )
+    history_key = f"marketplace_assistant_history_{customer_session_id}"
+    history = st.session_state.get(history_key, [])
+    for message in history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    question = st.chat_input("Ask anything, or compare a product across shops...")
+    if not question:
+        return
+
+    with st.chat_message("user"):
+        st.markdown(question)
+    try:
+        with st.chat_message("assistant"):
+            with st.spinner("Checking shop listings and preparing an answer..."):
+                answer = AIAgent().chat_marketplace(question, history)
+            st.markdown(answer)
+    except Exception:
+        logger.exception("Marketplace assistant failed for customer session %s", customer_session_id)
+        answer = (
+            "I couldn't prepare an answer right now. You can still use the dashboard search "
+            "to check live shop and product listings."
+        )
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+
+    st.session_state[history_key] = history + [
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": answer},
+    ]
+    st.rerun()
+
+
 def _render_customer_assistant(business, customer_session_id):
+    scopes = ["All shops"]
+    if business:
+        scopes.append(f"This shop: {business['name']}")
+    scope = st.radio(
+        "Assistant scope",
+        scopes,
+        horizontal=True,
+        key="customer_assistant_scope",
+    )
+    if scope == "All shops":
+        _render_customer_marketplace_assistant(customer_session_id)
+        return
+    _render_customer_shop_assistant(business, customer_session_id)
+
+
+def _render_customer_shop_assistant(business, customer_session_id):
     st.title("AI Shopping Assistant")
     st.caption(f"Ask about products, current prices, availability, shop policies, and orders · {business['name']}")
     business_id = business["business_id"]
@@ -2323,6 +3063,7 @@ def _render_customer_assistant(business, customer_session_id):
                             business_id,
                             question.strip(),
                             customer_phone=st.session_state.get("customer_phone"),
+                            customer_name=st.session_state.get("customer_name"),
                             customer_session_id=customer_session_id,
                             conversation_id=conversation_id,
                             customer_address=st.session_state.get("customer_address"),
@@ -2345,7 +3086,7 @@ def _render_customer_interface():
 
     business_id = st.session_state.get("customer_business_id")
     business = get_customer_business(business_id) if business_id else None
-    customer_pages = ["Dashboard", "AI Assistant", "Shops", "Orders", "Settings"]
+    customer_pages = ["Dashboard", "AI Assistant", "Orders", "Settings"]
     requested_page = st.session_state.pop("requested_customer_page", None)
     if requested_page in customer_pages:
         st.session_state.customer_page = requested_page
@@ -2361,21 +3102,17 @@ def _render_customer_interface():
         st.sidebar.caption(business.get("category") or "Shop")
         if st.sidebar.button("Switch Shop", key="customer_switch_shop"):
             st.session_state.customer_business_id = None
-            st.session_state.requested_customer_page = "Shops"
+            st.session_state.customer_shop_detail = False
+            st.session_state.requested_customer_page = "Dashboard"
             st.rerun()
 
-    if page in {"Dashboard", "Shops"}:
-        if page == "Dashboard" and business:
+    if page == "Dashboard":
+        if business and st.session_state.get("customer_shop_detail"):
             _render_customer_shop_page(customer_session_id, business)
         else:
-            _render_customer_business_selection(customer_session_id)
+            _render_customer_dashboard()
     elif page == "AI Assistant":
-        if business:
-            _render_customer_assistant(business, customer_session_id)
-        else:
-            st.title("AI Shopping Assistant")
-            st.info("Choose a shop first to start a shop-specific conversation.")
-            _render_customer_business_selection(customer_session_id)
+        _render_customer_assistant(business, customer_session_id)
     elif page == "Orders":
         _render_customer_orders_page(customer_session_id)
     elif page == "Settings":
@@ -2463,7 +3200,7 @@ def _render_dashboard_home_page():
         else:
             st.info("No products added yet.")
         if st.button("Manage Products", key="home_products"):
-            st.session_state.requested_dashboard_page = "📦 Products"
+            st.session_state.requested_dashboard_page = "📦 Products & Stock"
             st.rerun()
 
         st.subheader("Recent Orders")
@@ -2528,25 +3265,22 @@ def _render_customer_chats_page():
         return
 
     conversations = _get_recent_conversations(business_id, limit=50)
+    st.title("Customer Chats")
+    st.caption("Select a conversation to view and reply without leaving this page.")
     if not conversations:
         st.info("No customer conversations yet.")
         return
 
-    st.title("Customer Chats")
     status_filter = st.selectbox("Filter conversations", ["All", "AI_HANDLING", "ESCALATED", "KEEPER_HANDLING", "RESOLVED"])
     visible = [item for item in conversations if status_filter == "All" or item["status"] == status_filter]
     if not visible:
         st.info("No conversations match this status.")
         return
-    selected_id = st.selectbox(
-        "Conversation",
-        [item["id"] for item in visible],
-        index=next((i for i, item in enumerate(visible) if item["id"] == st.session_state.get("selected_customer_chat_id")), 0),
-        format_func=lambda conversation_id: next(
-            f"{item['customer_phone']} · {item['status']} · {item['latest_message'][:55]}"
-            for item in visible if item["id"] == conversation_id
-        ),
-    )
+
+    visible_ids = [item["id"] for item in visible]
+    selected_id = st.session_state.get("selected_customer_chat_id")
+    if selected_id not in visible_ids:
+        selected_id = visible_ids[0]
     st.session_state.selected_customer_chat_id = selected_id
 
     session = get_session()
@@ -2569,42 +3303,65 @@ def _render_customer_chats_page():
     finally:
         session.close()
 
-    status_columns = st.columns([3, 1])
-    with status_columns[0]:
-        st.markdown(f"**Customer:** {conversation.customer_phone or 'Unknown'}")
-    with st.form(f"conversation_status_{selected_id}"):
-        status = st.selectbox(
-            "Conversation status",
-            ["AI_HANDLING", "ESCALATED", "KEEPER_HANDLING", "RESOLVED"],
-            index=["AI_HANDLING", "ESCALATED", "KEEPER_HANDLING", "RESOLVED"].index(current_status),
-        )
-        update_status = st.form_submit_button("Update Status")
-    if update_status and status != current_status:
-        set_conversation_status(business_id, selected_id, status)
-        st.rerun()
-
-    st.subheader("Conversation")
-    if messages:
-        for message in messages:
-            sender = "Shopkeeper" if message.sender == MessageSender.KEEPER else "Customer" if message.sender == MessageSender.CUSTOMER else "AI"
-            st.markdown(f"**{sender}** · {message.timestamp.strftime('%d %b %Y %I:%M %p') if message.timestamp else ''}")
-            st.write(message.text)
-    else:
-        st.info("No messages in this conversation yet.")
-
-    with st.form(f"reply_to_customer_{selected_id}"):
-        reply = st.text_area("Reply to customer", placeholder="Write a response...")
-        send_reply = st.form_submit_button("Send Reply")
-    if send_reply:
-        if not reply.strip():
-            st.warning("Enter a reply before sending.")
-        else:
-            try:
-                save_shopkeeper_reply(business_id, selected_id, reply)
-                st.success("Reply saved and the conversation is now handled by the shopkeeper.")
+    list_column, chat_column = st.columns([1, 1.8], gap="large")
+    with list_column:
+        st.subheader("Conversations")
+        for item in visible:
+            if st.button(
+                f"{item['customer_phone']} · {item['status']}",
+                key=f"customer_chat_select_{item['id']}",
+                type="primary" if item["id"] == selected_id else "secondary",
+                width="stretch",
+            ):
+                st.session_state.selected_customer_chat_id = item["id"]
                 st.rerun()
-            except ValueError as exc:
-                st.error(str(exc))
+            st.caption(item["latest_message"] or "No messages yet")
+
+    with chat_column:
+        st.subheader(conversation.customer_phone or "Unknown customer")
+        with st.form(f"conversation_status_{selected_id}"):
+            status = st.selectbox(
+                "Conversation status",
+                ["AI_HANDLING", "ESCALATED", "KEEPER_HANDLING", "RESOLVED"],
+                index=["AI_HANDLING", "ESCALATED", "KEEPER_HANDLING", "RESOLVED"].index(current_status),
+            )
+            update_status = st.form_submit_button("Update Status")
+        if update_status and status != current_status:
+            set_conversation_status(business_id, selected_id, status)
+            st.rerun()
+
+        with st.container(height=400, border=True):
+            if messages:
+                for message in messages:
+                    sender = (
+                        "Shopkeeper"
+                        if message.sender == MessageSender.KEEPER
+                        else "Customer"
+                        if message.sender == MessageSender.CUSTOMER
+                        else "AI"
+                    )
+                    role = "user" if message.sender == MessageSender.CUSTOMER else "assistant"
+                    with st.chat_message(role):
+                        st.caption(
+                            f"{sender} · {message.timestamp.strftime('%d %b %Y %I:%M %p') if message.timestamp else ''}"
+                        )
+                        st.write(message.text)
+            else:
+                st.info("No messages in this conversation yet.")
+
+        with st.form(f"reply_to_customer_{selected_id}", clear_on_submit=True):
+            reply = st.text_area("Reply to customer", placeholder="Write a response...")
+            send_reply = st.form_submit_button("Send Reply")
+        if send_reply:
+            if not reply.strip():
+                st.warning("Enter a reply before sending.")
+            else:
+                try:
+                    save_shopkeeper_reply(business_id, selected_id, reply)
+                    st.success("Reply saved and the conversation is now handled by the shopkeeper.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
 
 
 def _render_escalated_chats_page():
@@ -2746,24 +3503,48 @@ def main():
             _show_login_page()
         return
 
-    nav_items = [
+    operations_items = ["🛒 Orders", "📦 Products & Stock"]
+    workspace_items = [
         "🏠 Dashboard",
-        "🛒 Orders",
-        "📦 Products",
-        "📋 Inventory",
         "💬 Customer Chats",
         "🔔 Notifications",
+        "🤖 AI Business Hub",
         "📊 Analytics & Reports",
-        "📚 Knowledge Base",
-        "🤖 AI Business Insights",
         "⚙️ Settings",
-        "🚪 Logout",
     ]
+    nav_items = workspace_items[:1] + operations_items + workspace_items[1:]
+    legacy_pages = {
+        "📦 Products": "📦 Products & Stock",
+        "📋 Inventory": "📦 Products & Stock",
+        "📚 Knowledge Base": "🤖 AI Business Hub",
+        "🤖 AI Business Insights": "🤖 AI Business Hub",
+        "🚪 Logout": "⚙️ Settings",
+    }
+    legacy_page = st.session_state.get("dashboard_page")
+    if legacy_page in legacy_pages:
+        st.session_state.dashboard_page = legacy_pages[legacy_page]
+        if legacy_page == "📚 Knowledge Base":
+            st.session_state.business_hub_default_tab = "Shop Knowledge"
+        elif legacy_page == "🤖 AI Business Insights":
+            st.session_state.business_hub_default_tab = "AI Insights"
     if st.session_state.get("dashboard_page") not in nav_items:
         st.session_state.dashboard_page = nav_items[0]
     requested_page = st.session_state.pop("requested_dashboard_page", None)
-    if requested_page in nav_items:
+    if requested_page in legacy_pages:
+        st.session_state.dashboard_page = legacy_pages[requested_page]
+        if requested_page == "📚 Knowledge Base":
+            st.session_state.business_hub_default_tab = "Shop Knowledge"
+        elif requested_page == "🤖 AI Business Insights":
+            st.session_state.business_hub_default_tab = "AI Insights"
+    elif requested_page in nav_items:
         st.session_state.dashboard_page = requested_page
+    current_page = st.session_state.dashboard_page
+    st.session_state.operations_page = (
+        current_page if current_page in operations_items else None
+    )
+    st.session_state.workspace_page = (
+        current_page if current_page in workspace_items else None
+    )
     st.sidebar.markdown(
         """
         <div class='brand-header'>
@@ -2787,30 +3568,42 @@ def main():
     unread_count = _get_unread_count(st.session_state.business_id)
     if unread_count:
         st.sidebar.caption(f"{unread_count} unread notification(s)")
-    page = st.sidebar.radio("Navigation", nav_items, key="dashboard_page")
-
-    if page == "🚪 Logout":
-        _logout()
-        return
+    st.sidebar.markdown("**Operations**")
+    st.sidebar.radio(
+        "Operations",
+        operations_items,
+        key="operations_page",
+        index=None,
+        label_visibility="collapsed",
+        on_change=_sync_dashboard_page,
+        args=("operations_page",),
+    )
+    st.sidebar.markdown("**Workspace**")
+    st.sidebar.radio(
+        "Workspace",
+        workspace_items,
+        key="workspace_page",
+        index=None,
+        label_visibility="collapsed",
+        on_change=_sync_dashboard_page,
+        args=("workspace_page",),
+    )
+    page = st.session_state.dashboard_page
 
     if page == "🏠 Dashboard":
         _render_dashboard_home_page()
     elif page == "📊 Analytics & Reports":
         _render_analytics_page()
-    elif page == "📦 Products":
+    elif page == "📦 Products & Stock":
         _render_products_page()
-    elif page == "📋 Inventory":
-        _render_inventory_page()
     elif page == "🛒 Orders":
         _render_orders_page()
     elif page == "💬 Customer Chats":
         _render_customer_chats_page()
     elif page == "🔔 Notifications":
         _render_notifications_page()
-    elif page == "📚 Knowledge Base":
-        _render_knowledge_base_page()
-    elif page == "🤖 AI Business Insights":
-        _render_ai_business_insights_page()
+    elif page == "🤖 AI Business Hub":
+        _render_ai_business_hub_page()
     elif page == "⚙️ Settings":
         _render_profile_page()
 

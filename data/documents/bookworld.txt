@@ -1,3 +1,4 @@
+Business Information:
 Business Name: BookWorld
 
 Category: Books & Stationery
@@ -13,10 +14,9 @@ Business Hours:
 Monday-Saturday: 9:30 AM-8:30 PM
 Sunday: 10:00 AM-6:00 PM
 
-Product Categories:
+Products:
 Books & Stationery essentials, relevant product lines, customer-requested selections, and store-supported accessories or complementary items.
 
-Product Knowledge:
 Our product lineup is selected for practical everyday use, convenience, and value. Product descriptions in the catalog are used for customer guidance, while live pricing and stock are managed through the transactional database.
 
 Return Policy:
@@ -25,31 +25,8 @@ Returns are accepted when the product is unused, in acceptable condition, and ac
 Exchange Policy:
 Eligible products may be exchanged when they remain in acceptable condition and match the applicable exchange rules. Customer support can confirm whether a specific item qualifies.
 
-Delivery Information:
+Delivery:
 Local delivery and store dispatch are available based on location, order size, and product category. Delivery timings are confirmed during checkout and by customer support.
 
 Customer Support:
 Customers can call the shop or ask the AI assistant about product details, order help, return guidance, and store timings. We do not use RAG to provide live price or live stock values.
-
-Frequently Asked Questions:
-Q: What products are available?
-A: The store offers a curated selection of products appropriate to our business category and local customer demand.
-
-Q: Do you offer returns?
-A: Yes, subject to product condition and applicable shop policy.
-
-Q: Do you have delivery support?
-A: Yes, local delivery and dispatch support are available based on order details and location.
-
-Q: Can I exchange a product?
-A: Eligible products may be exchanged when they are in acceptable condition and satisfy exchange rules.
-
-Q: Can I talk to the shopkeeper?
-A: Yes, customers can contact the business for product support, order questions, and policy clarifications.
-
-AI Usage Rules:
-- Use business knowledge only for this business.
-- Do not mix data from other businesses.
-- Do not use RAG to provide live price or live stock.
-- Price, stock, availability, order totals, and order status must come from the transactional database and product tools.
-- Answer using only the current business knowledge base and the active business context.

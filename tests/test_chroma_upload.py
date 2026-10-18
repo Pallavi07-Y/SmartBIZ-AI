@@ -1,8 +1,11 @@
 from types import SimpleNamespace
 
 from app.business.catalog import BusinessCatalog
+from app.business.register_business import BusinessManager
+from app.agent.tools import AgentTools
 from app.business.upload_documents import DocumentUploader
 from app.config import settings
+from app.database import Product, get_session
 from app.database.chroma_db import ChromaDBManager
 import app.rag.vector_store as vector_store_module
 
@@ -38,6 +41,23 @@ def test_upload_stores_documents_with_content_and_metadata(tmp_path, monkeypatch
     assert any("Samsung Galaxy S25" in document for document in stored["documents"])
     assert all(metadata["business_id"] == business_id for metadata in stored["metadatas"])
     assert any(metadata["type"] == "product" for metadata in stored["metadatas"])
+    stored_text = "\n".join(stored["documents"])
+    assert "Samsung Galaxy S25" in stored_text
+    assert "Price:" not in stored_text
+    assert "Availability:" not in stored_text
+
+
+def test_upload_does_not_fabricate_products_without_database_records(isolated_database):
+    shop = BusinessManager().register_business(
+        "Empty Catalog Shop",
+        "Electronics",
+        business_id="empty-catalog-shop",
+    )
+
+    catalog = BusinessCatalog(shop["business_id"])
+
+    assert catalog.products == []
+    assert catalog.get_product_names() == []
 
 
 def test_product_catalog_sync_uses_stable_product_vector_ids(monkeypatch):
@@ -75,7 +95,7 @@ def test_product_catalog_sync_uses_stable_product_vector_ids(monkeypatch):
     }
 
 
-def test_product_context_includes_live_catalog_fields():
+def test_product_rag_context_excludes_live_transaction_fields():
     catalog = BusinessCatalog.__new__(BusinessCatalog)
     catalog.business_id = "shop-42"
     catalog.products = [{
@@ -96,8 +116,155 @@ def test_product_context_includes_live_catalog_fields():
     context = catalog.get_product_context("USB-C Fast Charger")
 
     assert "Product Name: USB-C Fast Charger" in context
-    assert "Price: ₹1,999" in context
-    assert "Availability: In Stock" in context
-    assert "Stock Quantity: 30" in context
     assert "SKU: CHG-42" in context
     assert "Description: Compact fast charger" in context
+    assert "Price:" not in context
+    assert "Availability:" not in context
+    assert "Stock Quantity:" not in context
+
+
+def test_upload_replaces_stale_q_and_a_chunks_with_normal_sectioned_prose(
+    isolated_database,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "CHROMA_DB_PATH", str(tmp_path / "chroma"))
+    monkeypatch.setattr(vector_store_module, "EmbeddingModel", FakeEmbeddingModel)
+
+    source = tmp_path / "shop-knowledge.txt"
+    source.write_text(
+        "Frequently Asked Questions:\n"
+        "Q: Can I return an item?\n"
+        "A: Yes, an unused item can be returned with a receipt.\n\n"
+        "Delivery:\n"
+        + ("Delivery is available for local orders. " * 40),
+        encoding="utf-8",
+    )
+    uploader = DocumentUploader()
+    uploader.upload("shop-a", source)
+    collection = ChromaDBManager().get_collection("business_shop-a")
+    assert collection.count() > 1
+
+    source.write_text(
+        "Return Policy:\n"
+        "Unused products with proof of purchase may be returned.\n",
+        encoding="utf-8",
+    )
+    result = uploader.upload("shop-a", source)
+    stored = collection.get(include=["documents", "metadatas"])
+
+    assert result["documents_added"] == 1
+    assert collection.count() == 1
+    assert "Frequently Asked Questions" not in stored["documents"][0]
+    assert "Q:" not in stored["documents"][0]
+    assert stored["metadatas"][0]["business_id"] == "shop-a"
+    assert stored["metadatas"][0]["document_type"] == "business_knowledge"
+
+
+def test_same_filename_stem_in_different_formats_keeps_separate_chunks(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "CHROMA_DB_PATH", str(tmp_path / "chroma"))
+    monkeypatch.setattr(vector_store_module, "EmbeddingModel", FakeEmbeddingModel)
+
+    text_file = tmp_path / "shop-info.txt"
+    csv_file = tmp_path / "shop-info.csv"
+    text_file.write_text(
+        "Return Policy:\nUnused items may be returned with proof of purchase.",
+        encoding="utf-8",
+    )
+    csv_file.write_text(
+        "Topic,Details\nDelivery,Orders can be delivered locally.",
+        encoding="utf-8",
+    )
+    uploader = DocumentUploader()
+    uploader.upload("shop-a", text_file)
+    uploader.upload("shop-a", csv_file)
+
+    collection = ChromaDBManager().get_collection("business_shop-a")
+    stored = collection.get(include=["documents", "metadatas"])
+
+    assert collection.count() == 2
+    assert {metadata["document_name"] for metadata in stored["metadatas"]} == {
+        "shop-info.txt",
+        "shop-info.csv",
+    }
+
+
+def test_uploading_only_transactional_fields_removes_stale_indexed_values(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "CHROMA_DB_PATH", str(tmp_path / "chroma"))
+    monkeypatch.setattr(vector_store_module, "EmbeddingModel", FakeEmbeddingModel)
+
+    source = tmp_path / "product.txt"
+    source.write_text(
+        "Product Name: Charger One\n"
+        "Brand: Example\n"
+        "Price: ₹1,999\n"
+        "Stock Quantity: 8\n",
+        encoding="utf-8",
+    )
+    uploader = DocumentUploader()
+    uploader.upload("shop-a", source)
+    collection = ChromaDBManager().get_collection("business_shop-a")
+    assert collection.count() == 1
+
+    source.write_text(
+        "Price: ₹2,099\n"
+        "Stock Quantity: 4\n",
+        encoding="utf-8",
+    )
+    result = uploader.upload("shop-a", source)
+
+    assert result["documents_added"] == 0
+    assert collection.count() == 0
+
+
+def test_live_product_prices_and_stock_are_read_from_the_active_business_database(
+    isolated_database,
+):
+    shop = BusinessManager().register_business(
+        "Live Catalog Shop",
+        "Electronics",
+        business_id="live-catalog-shop",
+    )
+    session = get_session()
+    try:
+        product = Product(
+            business_id=shop["business_id"],
+            product_name="USB-C Charger",
+            category="Accessories",
+            price=1900,
+            stock_quantity=7,
+            availability="In Stock",
+            is_active=True,
+        )
+        session.add(product)
+        session.commit()
+        product_id = product.id
+    finally:
+        session.close()
+
+    tools = AgentTools.__new__(AgentTools)
+    current_product = tools.get_live_products(shop["business_id"], query="charger")[0]
+    assert current_product["price"] == 1900
+    assert current_product["stock_quantity"] == 7
+    assert current_product["availability"] == "In Stock"
+
+    session = get_session()
+    try:
+        product = session.get(Product, product_id)
+        product.price = 2100
+        product.stock_quantity = 0
+        product.availability = "Out of Stock"
+        session.commit()
+    finally:
+        session.close()
+
+    updated_product = tools.get_live_products(shop["business_id"], query="charger")[0]
+    assert updated_product["price"] == 2100
+    assert updated_product["stock_quantity"] == 0
+    assert updated_product["availability"] == "Out of Stock"

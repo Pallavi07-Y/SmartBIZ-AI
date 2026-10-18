@@ -18,7 +18,7 @@ Rules:
 
 3. If context is provided, answer ONLY from the provided context.
 
-3a. Use retrieved, business-scoped context for business profile, shop name, policies, and product details. When live product data is also provided, SQLite is authoritative for price, stock, and availability.
+3a. Use retrieved, business-scoped context for business profile, shop name, policies, and non-transactional product details. Prices, stock, availability, order totals, and order status must come only from live transactional tools; ignore those values in retrieved documents.
 
 4. Never make up information.
 

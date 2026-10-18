@@ -160,6 +160,7 @@ def get_business_metrics(business_id, *, today=None, date_from=None, date_to=Non
                 "quantity": sum(item["quantity"] for item in items),
                 "total": order_total,
                 "status": status,
+                "payment_method": order.payment_method,
                 "created_at": order.created_at,
             })
 

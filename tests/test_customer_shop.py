@@ -16,8 +16,9 @@ from app.dashboard import (
     get_customer_conversations,
     get_customer_orders,
     get_customer_products,
+    search_customer_marketplace,
 )
-from app.seed_demo_data import seed_demo_shops
+from app.seed_demo_data import DEMO_SHOPS, _shop_document, seed_demo_shops
 
 
 def test_demo_rag_dataset_has_exact_business_ids_and_documents(isolated_database, tmp_path):
@@ -53,6 +54,24 @@ def test_demo_rag_dataset_has_exact_business_ids_and_documents(isolated_database
         assert document_path.exists(), f"Missing demo document: {document_path}"
         content = document_path.read_text(encoding="utf-8")
         assert "Business ID:" in content
+        assert "Frequently Asked Questions:" not in content
+
+
+def test_default_shop_knowledge_template_uses_prose_sections_without_qa_pairs():
+    template = _shop_document(DEMO_SHOPS[0])
+
+    assert "Frequently Asked Questions:" not in template
+    assert "Q:" not in template
+    assert "A:" not in template
+    for section in (
+        "Business Information:",
+        "Products:",
+        "Return Policy:",
+        "Exchange Policy:",
+        "Delivery:",
+        "Customer Support:",
+    ):
+        assert section in template
 
 
 def test_customer_business_lookup_and_business_isolation(isolated_database):
@@ -95,6 +114,111 @@ def test_customer_product_search_uses_business_scope(isolated_database):
     search_results = get_customer_products(shop["business_id"], query="iphone")
     assert len(search_results) == 1
     assert search_results[0]["product_name"] == "iPhone 16"
+
+
+def test_customer_marketplace_search_finds_products_across_shops(isolated_database):
+    manager = BusinessManager()
+    shop_a = manager.register_business("Golden Lane", "Jewellery", username="golden-lane")
+    shop_b = manager.register_business("City Gifts", "Gifts", username="city-gifts")
+    session = get_session()
+    try:
+        session.add_all([
+            Product(
+                business_id=shop_a["business_id"],
+                product_name="Gold Ring",
+                category="Jewellery",
+                price=12000,
+                stock_quantity=2,
+                is_active=True,
+            ),
+            Product(
+                business_id=shop_b["business_id"],
+                product_name="Silver Pendant",
+                category="Jewellery",
+                price=3000,
+                stock_quantity=4,
+                is_active=True,
+            ),
+        ])
+        session.commit()
+    finally:
+        session.close()
+
+    shops, products = search_customer_marketplace("gold ring")
+
+    assert [shop["name"] for shop in shops] == ["Golden Lane"]
+    assert [product["product_name"] for product in products] == ["Gold Ring"]
+    assert products[0]["shop_name"] == "Golden Lane"
+
+
+def test_marketplace_assistant_compares_live_listings_without_claiming_reviews(isolated_database):
+    manager = BusinessManager()
+    shop_a = manager.register_business("Golden Lane", "Jewellery", username="gold-lane-ai")
+    shop_b = manager.register_business("City Jewels", "Jewellery", username="city-jewels-ai")
+    session = get_session()
+    try:
+        session.add_all([
+            Product(
+                business_id=shop_a["business_id"],
+                product_name="Gold Ring",
+                category="Jewellery",
+                price=12000,
+                stock_quantity=2,
+                is_active=True,
+            ),
+            Product(
+                business_id=shop_b["business_id"],
+                product_name="Gold Ring",
+                category="Jewellery",
+                price=11500,
+                stock_quantity=0,
+                is_active=True,
+            ),
+            Order(
+                business_id=shop_b["business_id"],
+                customer_phone="1234567890",
+                items=[{"product_name": "Gold Ring", "quantity": 1, "price": 11500}],
+                status="COMPLETED",
+            ),
+        ])
+        session.commit()
+    finally:
+        session.close()
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.tools = AgentTools.__new__(AgentTools)
+    answer = agent.chat_marketplace("I want to buy a gold ring. Which shop is best according to reviews?")
+
+    assert "Golden Lane" in answer
+    assert "₹12,000" in answer
+    assert "currently out of stock" in answer
+    assert "recorded order" in answer
+    assert "don't have verified customer reviews" in answer
+
+
+def test_marketplace_assistant_does_not_recommend_unrelated_items(isolated_database):
+    shop = BusinessManager().register_business("Everyday Shop", "General", username="everyday-shop")
+    session = get_session()
+    try:
+        session.add(Product(
+            business_id=shop["business_id"],
+            product_name="Cotton Shirt",
+            category="Clothing",
+            price=1000,
+            stock_quantity=3,
+            is_active=True,
+        ))
+        session.commit()
+    finally:
+        session.close()
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.tools = AgentTools.__new__(AgentTools)
+    answer = agent.chat_marketplace("I want to buy a gold ring. Which shop is best?")
+
+    assert "couldn't find a current shop listing" in answer
+    assert "Cotton Shirt" not in answer
+    assert "database" not in answer.casefold()
 
 
 def test_demo_shop_seed_is_ten_businesses_and_idempotent(isolated_database):
@@ -162,7 +286,12 @@ def test_demo_shop_seed_indexes_all_business_documents(isolated_database, tmp_pa
     assert all(collection == f"business_{business_id}" for collection, business_id, _ in indexed_products)
     assert all(document.metadata["business_id"] == business_id for _, business_id, document in indexed_products)
     assert {document.metadata["type"] for _, _, document in indexed_products} == {"product"}
-    assert any("USB-C Fast Charger" in document.page_content and "₹1,999" in document.page_content for _, _, document in indexed_products)
+    product_context = "\n".join(document.page_content for _, _, document in indexed_products)
+    assert "USB-C Fast Charger" in product_context
+    assert "₹1,999" not in product_context
+    assert "Price:" not in product_context
+    assert "Availability:" not in product_context
+    assert "Stock Quantity:" not in product_context
 
 
 def test_demo_shop_seed_indexes_business_specific_knowledge(isolated_database, tmp_path, monkeypatch):
@@ -314,6 +443,8 @@ def test_customer_checkout_uses_sqlite_price_stock_and_session(isolated_database
         quantity=2,
         customer_session_id="checkout-session-a",
         customer_address="Main Road",
+        payment_method="COD",
+        confirmed=True,
     )
     assert first["total"] == 240
     assert first["customer_session_id"] == "checkout-session-a"
@@ -327,6 +458,8 @@ def test_customer_checkout_uses_sqlite_price_stock_and_session(isolated_database
         "Checkout Phone",
         quantity=2,
         customer_session_id="checkout-session-a",
+        payment_method="COD",
+        confirmed=True,
     )
     assert second["error"] == "There is not enough stock to complete this order."
 
@@ -434,12 +567,13 @@ def test_customer_agent_exact_product_query_includes_scoped_context(isolated_dat
 
     llm_inputs = []
     rag_calls = []
+    live_tools = AgentTools.__new__(AgentTools)
 
     class ProductTools:
         rag = SimpleNamespace(is_business_query=lambda query: True)
 
         def get_live_products(self, business_id, **kwargs):
-            return AgentTools.get_live_products(self, business_id, **kwargs)
+            return live_tools.get_live_products(business_id, **kwargs)
 
         def get_business_context(self, business_id, query):
             rag_calls.append((business_id, query))
@@ -539,10 +673,9 @@ def test_customer_agent_routes_live_product_questions_and_keeps_shop_memory_sepa
     )
 
     assert first["reply"] == "Samsung Galaxy S25 is priced at ₹75,000."
-    assert followup["reply"] == "Verified shop response 1"
+    assert followup["reply"] == "Samsung Galaxy S25 is in stock (4 unit(s) available)."
     assert second_shop["reply"] == "Blue Cotton Shirt is priced at ₹1,200."
-    assert len(llm_inputs) == 1
-    assert '"price": 75000' in llm_inputs[0][1]["content"]
+    assert llm_inputs == []
 
     session = get_session()
     try:

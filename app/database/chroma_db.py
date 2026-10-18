@@ -1,4 +1,3 @@
-import uuid
 import chromadb
 
 from app.config import settings
@@ -28,11 +27,25 @@ class ChromaDBManager:
         embeddings,
         business_id
     ):
-
         collection = self.get_collection(
             collection_name
         )
 
+        ids, texts, metadatas = self._prepare_documents(documents, business_id)
+        collection.add(
+            ids=ids,
+            documents=texts,
+            embeddings=embeddings,
+            metadatas=metadatas
+        )
+
+        return {
+            "status": "success",
+            "documents_added": len(texts)
+        }
+
+    @staticmethod
+    def _prepare_documents(documents, business_id):
         ids = []
         texts = []
         metadatas = []
@@ -50,12 +63,32 @@ class ChromaDBManager:
             texts.append(doc.page_content)
             metadatas.append(metadata)
 
-        collection.add(
-            ids=ids,
-            documents=texts,
-            embeddings=embeddings,
-            metadatas=metadatas
-        )
+        return ids, texts, metadatas
+
+    def replace_documents(
+        self,
+        collection_name,
+        documents,
+        embeddings,
+        business_id,
+        metadata_filter,
+    ):
+        collection = self.get_collection(collection_name)
+        ids, texts, metadatas = self._prepare_documents(documents, business_id)
+        previous = collection.get(where=metadata_filter, include=["metadatas"])
+        previous_ids = set(previous.get("ids", []))
+
+        if ids:
+            collection.upsert(
+                ids=ids,
+                documents=texts,
+                embeddings=embeddings,
+                metadatas=metadatas,
+            )
+
+        stale_ids = previous_ids.difference(ids)
+        if stale_ids:
+            collection.delete(ids=list(stale_ids))
 
         return {
             "status": "success",
@@ -98,11 +131,8 @@ class ChromaDBManager:
 
     def delete_by_metadata(self, collection_name, metadata_filter):
         collection = self.get_collection(collection_name)
-        try:
-            collection.delete(where=metadata_filter)
-            return True
-        except Exception:
-            return False
+        collection.delete(where=metadata_filter)
+        return True
 
     def delete_collection(self, collection_name):
 

@@ -26,6 +26,8 @@ class BusinessController:
         password=None,
         owner_name=None,
         business_id=None,
+        latitude=None,
+        longitude=None,
     ):
 
         return self.register.register_business(
@@ -37,6 +39,8 @@ class BusinessController:
             password_hash=hash_password(password) if password else None,
             owner_name=owner_name,
             business_id=business_id,
+            latitude=latitude,
+            longitude=longitude,
         )
 
     def authenticate_business(self, business_id, password):
@@ -55,6 +59,10 @@ class BusinessController:
                 "name": business.name,
                 "owner_name": business.owner_name,
                 "category": business.category,
+                "address": business.address,
+                "latitude": business.latitude,
+                "longitude": business.longitude,
+                "location_precision": business.location_precision,
                 "owner_phone": business.owner_phone,
                 "role": "shopkeeper",
             }

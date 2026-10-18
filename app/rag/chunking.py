@@ -1,189 +1,92 @@
-"""
-chunking.py
+import re
 
-Splits documents into smaller chunks
-before generating embeddings.
-"""
-
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.config import settings
 
 
 class DocumentChunker:
+    SECTION_HEADER = re.compile(
+        r"^(?:#{1,6}\s+(.+?)\s*#*|([A-Za-z][A-Za-z0-9 &()/,_-]{1,78}):)\s*$"
+    )
+    PRODUCT_CATEGORY = re.compile(
+        r"\b(?:smart\s*phones?|mobiles?|iphones?|galax(?:y|ies)|oneplus)\b",
+        re.IGNORECASE,
+    )
+    LAPTOP_CATEGORY = re.compile(
+        r"\b(?:laptops?|notebooks?|vivobook|thinkpad|macbook|ssd\s+upgrade)\b",
+        re.IGNORECASE,
+    )
 
     def __init__(self):
-
         self.text_splitter = RecursiveCharacterTextSplitter(
-
             chunk_size=settings.CHUNK_SIZE,
-
             chunk_overlap=settings.CHUNK_OVERLAP,
-
-            separators=[
-                "\n\n",
-                "\n",
-                ". ",
-                " ",
-                ""
-            ]
+            separators=["\n\n", "\n", ". ", " ", ""],
         )
 
-        self.business_terms = [
-            "business name:",
-            "business id:",
-            "owner:",
-            "address:",
-            "contact number:",
-            "email:",
-            "website:",
-            "working hours:",
-            "payment methods:",
-            "complete business knowledge base",
-            "about our shop"
-        ]
+    @classmethod
+    def _split_sections(cls, document):
+        sections = []
+        current_heading = None
+        current_lines = []
 
-        self.faq_terms = [
-            "q:",
-            "a:",
-            "do you provide",
-            "do you offer",
-            "do you sell",
-            "how do",
-            "can i",
-            "what are your",
-            "what products do you sell"
-        ]
+        def add_section():
+            text = "\n".join(current_lines).strip()
+            if text:
+                sections.append((current_heading, text))
 
-        self.product_terms = [
-            "brand:",
-            "product name:",
-            "price:",
-            "price range:",
-            "ram:",
-            "storage:",
-            "processor:",
-            "display:",
-            "battery:",
-            "availability:",
-            "category:",
-            "samsung",
-            "iphone",
-            "oneplus",
-            "nothing",
-            "vivo",
-            "realme",
-            "xiaomi",
-            "oppo",
-            "accessories",
-            "mobile covers",
-            "screen guards",
-            "chargers",
-            "fast chargers",
-            "power banks",
-            "laptop",
-            "notebook",
-            "intel",
-            "amd",
-            "ryzen",
-            "core",
-            "ssd",
-            "gpu"
-        ]
-
-        self.smartphone_brands = [
-            "samsung",
-            "iphone",
-            "oneplus",
-            "nothing",
-            "vivo",
-            "realme",
-            "xiaomi",
-            "oppo"
-        ]
-
-        self.laptop_terms = [
-            "laptop",
-            "notebook",
-            "intel",
-            "amd",
-            "ryzen",
-            "core",
-            "processor",
-            "ssd",
-            "gpu",
-            "graphics",
-            "ram",
-            "storage",
-            "battery"
-        ]
-
-    def _classify_chunk(self, chunk):
-
-        text = chunk.page_content.lower()
-        metadata = dict(chunk.metadata or {})
-
-        if any(term in text for term in self.business_terms):
-            metadata["type"] = "business"
-
-        elif any(term in text for term in self.faq_terms):
-            metadata["type"] = "faq"
-
-        elif any(term in text for term in self.product_terms):
-            metadata["type"] = "product"
-
-            explicit_category_keywords = [
-                ("laptop", "laptop"),
-                ("notebook", "laptop"),
-                ("smartphone", "smartphone"),
-                ("phone", "smartphone"),
-            ]
-            for keyword, category in explicit_category_keywords:
-                if keyword in text:
-                    metadata["category"] = category
-                    break
+        for line in document.page_content.splitlines():
+            match = cls.SECTION_HEADER.fullmatch(line.strip())
+            heading = (match.group(1) or match.group(2)).strip() if match else None
+            if heading and heading.casefold() not in {"q", "a"}:
+                add_section()
+                current_heading = heading
+                current_lines = [heading + ":"]
             else:
-                # Literal product keywords must outrank generic hardware hints like RAM/SSD,
-                # while preserving brand-based smartphone detection for names such as
-                # "Samsung Galaxy S25".
-                smartphone_identifiers = self.smartphone_brands + [
-                    "galaxy",
-                    "pixel",
-                ]
-                if any(identifier in text for identifier in smartphone_identifiers):
-                    metadata["category"] = "smartphone"
-                elif any(term in text for term in self.laptop_terms):
-                    metadata["category"] = "laptop"
-                elif "mobile covers" in text or "screen guards" in text or "chargers" in text or "power banks" in text:
-                    metadata["category"] = "accessories"
-                elif any(term in text for term in ["ram", "gb", "ssd"]):
-                    metadata["category"] = "laptop"
+                current_lines.append(line)
+
+        add_section()
+        return sections or [(None, document.page_content.strip())]
+
+    @staticmethod
+    def _classify_chunk(chunk):
+        section = str(chunk.metadata.get("section") or "").casefold()
+        text = chunk.page_content.casefold()
+        is_product = section in {"product", "products", "product knowledge", "product categories"}
+        is_product = is_product or any(
+            term in text for term in ("product name:", "brand:", "processor:", "storage:")
+        )
+        if is_product:
+            chunk.metadata["type"] = "product"
+            if not chunk.metadata.get("category"):
+                if DocumentChunker.PRODUCT_CATEGORY.search(text):
+                    chunk.metadata["category"] = "smartphone"
+                elif DocumentChunker.LAPTOP_CATEGORY.search(text) or (
+                    "ssd" in text and "ram" in text
+                ):
+                    chunk.metadata["category"] = "laptop"
                 else:
-                    metadata.setdefault("category", "product")
-
+                    chunk.metadata["category"] = "product"
         else:
-            # Default to product for content-rich chunks and business only for pure profile blocks
-            metadata["type"] = "product"
-            metadata.setdefault("category", "product")
-
-        chunk.metadata = metadata
-
+            chunk.metadata["type"] = "business"
         return chunk
 
     def split_documents(self, documents):
-
-        chunks = self.text_splitter.split_documents(documents)
-
-        return [
-            self._classify_chunk(chunk)
-            for chunk in chunks
-        ]
+        chunks = []
+        for document in documents:
+            for section, text in self._split_sections(document):
+                metadata = dict(document.metadata or {})
+                if section:
+                    metadata["section"] = section
+                for chunk_text in self.text_splitter.split_text(text):
+                    chunks.append(
+                        self._classify_chunk(
+                            Document(page_content=chunk_text, metadata=dict(metadata))
+                        )
+                    )
+        return chunks
 
     def split_text(self, text):
-
-        chunks = self.text_splitter.create_documents([text])
-
-        return [
-            self._classify_chunk(chunk)
-            for chunk in chunks
-        ]
+        return self.split_documents([Document(page_content=text)])

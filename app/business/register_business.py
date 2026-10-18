@@ -1,5 +1,6 @@
 from app.database import Business, configure_database, get_session
 from app.utils.auth import generate_business_id, normalize_phone
+from app.utils.location import validate_coordinates
 
 
 class BusinessManager:
@@ -18,7 +19,18 @@ class BusinessManager:
         password_hash=None,
         owner_name=None,
         business_id=None,
+        latitude=None,
+        longitude=None,
     ):
+        if (latitude is None or str(latitude).strip() == "") and (
+            longitude is None or str(longitude).strip() == ""
+        ):
+            latitude = longitude = None
+        elif latitude is None or str(latitude).strip() == "" or longitude is None or str(longitude).strip() == "":
+            raise ValueError("Enter both shop coordinates, or leave both blank.")
+        else:
+            latitude, longitude = validate_coordinates(latitude, longitude)
+
         session = get_session()
         try:
             normalized_phone = normalize_phone(owner_phone)
@@ -37,6 +49,9 @@ class BusinessManager:
                 owner_name=owner_name,
                 category=category,
                 address=address,
+                latitude=latitude,
+                longitude=longitude,
+                location_precision="shop" if latitude is not None else None,
                 owner_phone=normalized_phone or owner_phone,
                 username=username or f"shop-{generated_business_id.lower()}",
                 password_hash=password_hash,
@@ -49,6 +64,9 @@ class BusinessManager:
                 "owner_name": business.owner_name,
                 "category": business.category,
                 "address": business.address,
+                "latitude": business.latitude,
+                "longitude": business.longitude,
+                "location_precision": business.location_precision,
                 "owner_phone": business.owner_phone,
                 "username": business.username,
                 "password_hash": business.password_hash,

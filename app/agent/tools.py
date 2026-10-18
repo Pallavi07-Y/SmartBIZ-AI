@@ -3,12 +3,11 @@ from pathlib import Path
 
 from app.business.business_manager import BusinessController
 from app.rag.rag_pipeline import RAGPipeline
-from app.rag.document_loader import DocumentLoader
-from app.rag.chunking import DocumentChunker
+from app.business.upload_documents import DocumentUploader
 from app.business.catalog import BusinessCatalog
 from app.utils.helpers import generate_order_id, validate_phone_number
 from app.utils.logger import logger
-from app.database import CartItem, Order, Product, configure_database, get_session
+from app.database import Business, CartItem, Order, Product, configure_database, get_session
 from app.notifications.notification_service import create_notification
 
 
@@ -19,6 +18,30 @@ class AgentTools:
         self.business = BusinessController()
         self.rag = RAGPipeline()
         configure_database()
+
+    @staticmethod
+    def _validated_business_id(business_id):
+        if (
+            not isinstance(business_id, str)
+            or not business_id.strip()
+            or len(business_id) > 128
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+", business_id.strip())
+        ):
+            raise ValueError("A valid business ID is required.")
+        return business_id.strip()
+
+    @staticmethod
+    def _validated_text(value, name, *, max_length=500, required=True):
+        if value is None and not required:
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"{name} must be text.")
+        value = value.strip()
+        if required and not value:
+            raise ValueError(f"{name} is required.")
+        if len(value) > max_length:
+            raise ValueError(f"{name} is too long.")
+        return value
 
 
     def get_business_details(
@@ -47,56 +70,45 @@ class AgentTools:
         query
     ):
 
+        business_id = self._validated_business_id(business_id)
+        query = self._validated_text(query, "Knowledge query", max_length=2000)
         collection_name = f"business_{business_id}"
 
         logger.debug("AgentTools.get_business_context: collection=%s query=%s", collection_name, query[:120].strip())
 
-        context = None
+        session = get_session()
+        try:
+            if session.query(Business.business_id).filter(
+                Business.business_id == business_id
+            ).first() is None:
+                return "No business information found."
+        finally:
+            session.close()
+
         try:
             context = self.rag.retrieve_context(
                 collection_name,
                 query
             )
-        except Exception as e:
-            logger.debug("AgentTools.get_business_context: Chroma retrieval failed: %s", e)
+        except Exception:
+            logger.exception("AgentTools.get_business_context: Chroma retrieval failed.")
+            raise
 
-        if context is None or context == "No business information found.":
+        if context == "No business information found.":
             collection_exists = self.rag.retriever.vector_store.db.collection_exists(collection_name)
-            collection_empty = False
-
-            if collection_exists:
-                try:
-                    collection = self.rag.retriever.vector_store.db.get_collection(collection_name)
-                    collection_empty = collection.count() == 0
-                except Exception as e:
-                    logger.debug("AgentTools.get_business_context: Unable to inspect collection contents: %s", e)
-
-            if not collection_exists or collection_empty:
-                if collection_empty:
-                    logger.debug("AgentTools.get_business_context: Chroma collection exists but is empty. Attempting local fallback.")
-                else:
-                    logger.debug("AgentTools.get_business_context: Chroma collection not found. Attempting local fallback.")
-                try:
-                    loader = DocumentLoader()
-                    folder_path = Path("data/documents") / business_id
-                    if folder_path.exists():
-                        docs = loader.load_folder(str(folder_path))
-                    else:
-                        docs = []
-
-                    if docs:
-                        chunker = DocumentChunker()
-                        chunks = chunker.split_documents(docs)
-
-                        document_distances = [(c.page_content, 0.1) for c in chunks]
-                        filtered = self.rag._filter_documents_for_query(document_distances, query)
-
-                        if filtered:
-                            context = "\n\n".join([d for d, _ in filtered])
-                except Exception as e:
-                    logger.debug("AgentTools fallback error: %s", e)
-            else:
-                logger.debug("AgentTools.get_business_context: No relevant Chroma documents found, skipping local fallback.")
+            collection_empty = (
+                not collection_exists
+                or self.rag.retriever.vector_store.db.get_collection(collection_name).count() == 0
+            )
+            folder_path = Path("data/documents") / business_id
+            if collection_empty and folder_path.is_dir():
+                uploader = DocumentUploader(
+                    vector_store=self.rag.retriever.vector_store
+                )
+                for document_path in folder_path.iterdir():
+                    if document_path.is_file():
+                        uploader.upload(business_id, document_path)
+                context = self.rag.retrieve_context(collection_name, query)
 
         logger.debug("AgentTools.get_business_context result length=%s", len(context) if isinstance(context, str) else 0)
 
@@ -104,8 +116,17 @@ class AgentTools:
 
     def get_live_products(self, business_id, query=None, *, category=None, available_only=False, limit=20):
         """Return current catalog values directly from SQLite for one business."""
-        if not business_id:
-            return []
+        business_id = self._validated_business_id(business_id)
+        query = self._validated_text(query, "Product query", required=False)
+        category = self._validated_text(category, "Product category", required=False)
+        if not isinstance(available_only, bool):
+            raise ValueError("available_only must be a boolean.")
+        if limit is not None and (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("Product result limit must be between 1 and 1000.")
 
         session = get_session()
         try:
@@ -146,8 +167,59 @@ class AgentTools:
         finally:
             session.close()
 
+    def get_marketplace_catalog(self, limit=250):
+        """Return active products with current shop data and recorded order counts."""
+        session = get_session()
+        try:
+            products = (
+                session.query(Product, Business)
+                .join(Business, Business.business_id == Product.business_id)
+                .filter(Product.is_active.is_(True))
+                .order_by(Product.product_name.asc())
+                .limit(limit)
+                .all()
+            )
+            order_counts = {}
+            orders = (
+                session.query(Order)
+                .filter(Order.status.notin_(("CANCELLED", "CANCELED")))
+                .all()
+            )
+            for order in orders:
+                for item in order.items if isinstance(order.items, list) else []:
+                    if not isinstance(item, dict) or not item.get("product_name"):
+                        continue
+                    key = (order.business_id, str(item["product_name"]).casefold())
+                    order_counts[key] = order_counts.get(key, 0) + 1
+
+            return [
+                {
+                    "id": product.id,
+                    "business_id": business.business_id,
+                    "shop_name": business.name,
+                    "shop_category": business.category,
+                    "shop_address": business.address,
+                    "product_name": product.product_name,
+                    "brand": product.brand,
+                    "category": product.category,
+                    "description": product.description,
+                    "price": product.price,
+                    "stock_quantity": max(0, product.stock_quantity or 0),
+                    "availability": product.availability or (
+                        "In Stock" if (product.stock_quantity or 0) > 0 else "Out of Stock"
+                    ),
+                    "recorded_orders": order_counts.get(
+                        (business.business_id, product.product_name.casefold()), 0
+                    ),
+                }
+                for product, business in products
+            ]
+        finally:
+            session.close()
+
     def get_catalog(self, business_id):
 
+        business_id = self._validated_business_id(business_id)
         return BusinessCatalog(business_id)
 
     def add_product(self, business_id, product_name, price=None, stock_quantity=0, category=None, brand=None, sku=None,
@@ -222,6 +294,8 @@ class AgentTools:
 
     def search_products(self, business_id, query):
 
+        business_id = self._validated_business_id(business_id)
+        query = self._validated_text(query, "Product query", max_length=2000)
         catalog = self.get_catalog(business_id)
         budget = None
         keywords = []
@@ -253,6 +327,8 @@ class AgentTools:
 
     def get_product_details(self, business_id, product_name):
 
+        business_id = self._validated_business_id(business_id)
+        product_name = self._validated_text(product_name, "Product name", max_length=200)
         catalog = self.get_catalog(business_id)
         return catalog.find_product(product_name)
 
@@ -268,19 +344,25 @@ class AgentTools:
 
     def add_to_cart(self, session_id, business_id, product_name, quantity=1):
 
-        catalog = self.get_catalog(business_id)
-        product = catalog.find_product(product_name)
-        if not product:
-            return {"error": "Product not found."}
-
-        if "out of stock" in product.get("availability", "").lower():
-            return {"error": "Product is currently out of stock."}
-
-        if quantity < 1:
-            return {"error": "Quantity must be at least 1."}
+        session_id = self._validated_text(session_id, "Customer session ID", max_length=200)
+        business_id = self._validated_business_id(business_id)
+        product_name = self._validated_text(product_name, "Product name", max_length=200)
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
+            return {"error": "Quantity must be a positive whole number."}
 
         session = get_session()
         try:
+            product = session.query(Product).filter(
+                Product.business_id == business_id,
+                Product.product_name == product_name,
+                Product.is_active.is_(True),
+            ).first()
+            if product is None:
+                return {"error": "Product not found."}
+            stock_quantity = max(0, product.stock_quantity or 0)
+            if stock_quantity == 0:
+                return {"error": "Product is currently out of stock."}
+
             cart_items = session.query(CartItem).filter_by(
                 session_id=session_id,
                 business_id=business_id,
@@ -292,16 +374,21 @@ class AgentTools:
                 ),
                 None,
             )
+            requested_quantity = quantity + (existing.quantity if existing else 0)
+            if requested_quantity > stock_quantity:
+                return {"error": "There is not enough stock to add that quantity to the cart."}
             if existing:
-                existing.quantity += quantity
+                existing.quantity = requested_quantity
+                existing.price = product.price
+                existing.availability = product.availability
             else:
                 session.add(CartItem(
                     session_id=session_id,
                     business_id=business_id,
-                    product_name=product["product_name"],
+                    product_name=product.product_name,
                     quantity=quantity,
-                    price=product.get("price"),
-                    availability=product.get("availability"),
+                    price=product.price,
+                    availability=product.availability,
                 ))
             session.commit()
             return {"cart": self._get_cart(session, session_id, business_id)}
@@ -311,14 +398,17 @@ class AgentTools:
         finally:
             session.close()
 
-    def remove_from_cart(self, session_id, product_name, business_id=None):
+    def remove_from_cart(self, session_id, product_name, business_id):
 
+        session_id = self._validated_text(session_id, "Customer session ID", max_length=200)
+        product_name = self._validated_text(product_name, "Product name", max_length=200)
+        business_id = self._validated_business_id(business_id)
         session = get_session()
         try:
-            query = session.query(CartItem).filter_by(session_id=session_id)
-            if business_id:
-                query = query.filter(CartItem.business_id == business_id)
-            items = query.all()
+            items = session.query(CartItem).filter_by(
+                session_id=session_id,
+                business_id=business_id,
+            ).all()
             for item in items:
                 if item.product_name.lower() == product_name.lower():
                     session.delete(item)
@@ -327,21 +417,25 @@ class AgentTools:
         finally:
             session.close()
 
-    def clear_cart(self, session_id, business_id=None):
+    def clear_cart(self, session_id, business_id):
 
+        session_id = self._validated_text(session_id, "Customer session ID", max_length=200)
+        business_id = self._validated_business_id(business_id)
         session = get_session()
         try:
-            query = session.query(CartItem).filter_by(session_id=session_id)
-            if business_id:
-                query = query.filter(CartItem.business_id == business_id)
-            query.delete()
+            session.query(CartItem).filter_by(
+                session_id=session_id,
+                business_id=business_id,
+            ).delete()
             session.commit()
             return {"cart": []}
         finally:
             session.close()
 
-    def get_cart(self, session_id, business_id=None):
+    def get_cart(self, session_id, business_id):
 
+        session_id = self._validated_text(session_id, "Customer session ID", max_length=200)
+        business_id = self._validated_business_id(business_id)
         session = get_session()
         try:
             return self._get_cart(session, session_id, business_id)
@@ -349,20 +443,36 @@ class AgentTools:
             session.close()
 
     @staticmethod
-    def _cart_item_to_dict(item):
+    def _cart_item_to_dict(item, product=None):
         return {
             "product_name": item.product_name,
             "quantity": item.quantity,
-            "price": item.price,
-            "availability": item.availability,
+            "price": product.price if product is not None else None,
+            "availability": (
+                product.availability or (
+                    "In Stock" if (product.stock_quantity or 0) > 0 else "Out of Stock"
+                )
+                if product is not None
+                else "Unavailable"
+            ),
+            "stock_quantity": max(0, product.stock_quantity or 0) if product is not None else 0,
         }
 
     def _get_cart(self, session, session_id, business_id=None):
+        if business_id is None:
+            raise ValueError("A business ID is required to access a cart.")
         query = session.query(CartItem).filter_by(session_id=session_id)
-        if business_id:
-            query = query.filter(CartItem.business_id == business_id)
+        query = query.filter(CartItem.business_id == business_id)
         items = query.all()
-        return [self._cart_item_to_dict(item) for item in items]
+        current_cart = []
+        for item in items:
+            product = session.query(Product).filter(
+                Product.business_id == business_id,
+                Product.product_name == item.product_name,
+                Product.is_active.is_(True),
+            ).first()
+            current_cart.append(self._cart_item_to_dict(item, product))
+        return current_cart
 
     def create_order(
         self,
@@ -373,56 +483,84 @@ class AgentTools:
         quantity=1,
         customer_session_id=None,
         customer_address=None,
+        payment_method=None,
+        product_id=None,
+        confirmed=False,
     ):
+
+        try:
+            business_id = self._validated_business_id(business_id)
+            customer_name = self._validated_text(customer_name, "Customer name", max_length=200)
+            product_name = self._validated_text(product_name, "Product name", max_length=200)
+            phone = self._validated_text(phone, "Phone number", max_length=32)
+            customer_address = self._validated_text(
+                customer_address,
+                "Customer address",
+                max_length=1000,
+                required=False,
+            )
+            if customer_session_id is not None:
+                customer_session_id = self._validated_text(
+                    customer_session_id,
+                    "Customer session ID",
+                    max_length=200,
+                )
+        except ValueError as exc:
+            return {"error": str(exc)}
 
         if not validate_phone_number(phone):
             return {"error": "Invalid phone number."}
 
-        catalog = self.get_catalog(business_id)
-        product = catalog.find_product(product_name)
-        if not product:
-            return {"error": "Product not found."}
-
-        if "out of stock" in product.get("availability", "").lower():
-            return {"error": "Product is currently out of stock."}
-
-        if quantity < 1:
-            return {"error": "Quantity must be at least 1."}
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
+            return {"error": "Quantity must be a positive whole number."}
+        if payment_method is None:
+            return {"error": "Payment method is required. Choose COD or EMI."}
+        payment_method = str(payment_method).strip().upper()
+        if payment_method not in {"COD", "EMI"}:
+            return {"error": "Unsupported payment method. Choose COD or EMI."}
+        if confirmed is not True:
+            return {"error": "Explicit customer confirmation is required before placing an order."}
+        if product_id is not None and (
+            isinstance(product_id, bool)
+            or not isinstance(product_id, int)
+            or product_id <= 0
+        ):
+            return {"error": "Product ID must be a positive integer."}
 
         order_id = generate_order_id()
         session = get_session()
         try:
-            inventory_product = None
-            if customer_session_id:
-                inventory_product = (
-                    session.query(Product)
-                    .filter(
-                        Product.business_id == business_id,
-                        Product.product_name.ilike(product["product_name"]),
-                        Product.is_active.is_(True),
-                    )
-                    .with_for_update()
-                    .first()
-                )
-                if inventory_product is None:
-                    return {"error": "Product is no longer available in this shop."}
-                if inventory_product.price is None:
-                    return {"error": "Price information is unavailable for this product."}
-                if inventory_product.stock_quantity < quantity:
-                    return {"error": "There is not enough stock to complete this order."}
-                price = inventory_product.price
-                inventory_product.stock_quantity -= quantity
-                inventory_product.availability = "Out of Stock" if inventory_product.stock_quantity <= 0 else "In Stock"
+            product_query = session.query(Product).filter(
+                Product.business_id == business_id,
+                Product.is_active.is_(True),
+            )
+            if product_id is not None:
+                product_query = product_query.filter(Product.id == product_id)
             else:
-                price = product.get("price")
-                if price is None:
-                    return {"error": "Price information is unavailable for this product."}
+                product_query = product_query.filter(Product.product_name == product_name)
+            inventory_product = product_query.with_for_update().first()
+            if inventory_product is None:
+                return {"error": "Product is no longer available in this shop."}
+            if inventory_product.price is None:
+                return {"error": "Price information is unavailable for this product."}
+            available_stock = max(0, inventory_product.stock_quantity or 0)
+            if available_stock == 0:
+                return {"error": f"Sorry, {inventory_product.product_name} is currently out of stock."}
+            if available_stock < quantity:
+                return {"error": "There is not enough stock to complete this order."}
+            price = inventory_product.price
+            inventory_product.stock_quantity -= quantity
+            inventory_product.availability = "Out of Stock" if inventory_product.stock_quantity <= 0 else "In Stock"
+            product = {
+                "product_name": inventory_product.product_name,
+                "availability": inventory_product.availability,
+            }
 
             order_items = [{
                 "product_name": product["product_name"],
                 "quantity": quantity,
                 "price": price,
-                "availability": inventory_product.availability if inventory_product else product.get("availability"),
+                "availability": inventory_product.availability,
                 "customer_name": customer_name,
             }]
             session.add(Order(
@@ -433,7 +571,8 @@ class AgentTools:
                 customer_address=customer_address,
                 items=order_items,
                 status="NEW",
-                stock_deducted=inventory_product is not None,
+                payment_method=payment_method,
+                stock_deducted=True,
             ))
             session.commit()
             order = self._order_to_dict(session.get(Order, order_id))
@@ -445,7 +584,7 @@ class AgentTools:
                 reference_type="ORDER",
                 reference_id=order_id,
             )
-            if inventory_product and inventory_product.stock_quantity <= inventory_product.low_stock_threshold:
+            if inventory_product.stock_quantity <= inventory_product.low_stock_threshold:
                 create_notification(
                     business_id,
                     "LOW_STOCK" if inventory_product.stock_quantity else "OUT_OF_STOCK",
@@ -463,6 +602,14 @@ class AgentTools:
 
     def get_order_status(self, business_id, order_id, customer_session_id=None):
 
+        business_id = self._validated_business_id(business_id)
+        order_id = self._validated_text(order_id, "Order ID", max_length=128)
+        if customer_session_id is not None:
+            customer_session_id = self._validated_text(
+                customer_session_id,
+                "Customer session ID",
+                max_length=200,
+            )
         session = get_session()
         try:
             query = session.query(Order).filter_by(id=order_id, business_id=business_id)
@@ -475,6 +622,13 @@ class AgentTools:
 
     def get_recent_orders(self, business_id, customer_session_id=None):
 
+        business_id = self._validated_business_id(business_id)
+        if customer_session_id is not None:
+            customer_session_id = self._validated_text(
+                customer_session_id,
+                "Customer session ID",
+                max_length=200,
+            )
         session = get_session()
         try:
             query = session.query(Order).filter_by(business_id=business_id)
@@ -502,4 +656,5 @@ class AgentTools:
             "price": price,
             "total": price * quantity,
             "status": status,
+            "payment_method": order.payment_method,
         }

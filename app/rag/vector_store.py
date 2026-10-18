@@ -27,6 +27,22 @@ class VectorStore:
             business_id
         )
 
+    def replace_documents(
+        self,
+        collection_name,
+        documents,
+        business_id,
+        metadata_filter,
+    ):
+        embeddings = self.embedding_model.embed_documents(documents) if documents else []
+        return self.db.replace_documents(
+            collection_name,
+            documents,
+            embeddings,
+            business_id,
+            metadata_filter,
+        )
+
     def search(
         self,
         collection_name,
