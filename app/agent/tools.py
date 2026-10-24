@@ -74,7 +74,7 @@ class AgentTools:
         query = self._validated_text(query, "Knowledge query", max_length=2000)
         collection_name = f"business_{business_id}"
 
-        logger.debug("AgentTools.get_business_context: collection=%s query=%s", collection_name, query[:120].strip())
+        logger.debug("AgentTools.get_business_context: collection=%s", collection_name)
 
         session = get_session()
         try:
@@ -90,8 +90,11 @@ class AgentTools:
                 collection_name,
                 query
             )
-        except Exception:
-            logger.exception("AgentTools.get_business_context: Chroma retrieval failed.")
+        except Exception as exc:
+            logger.error(
+                "AgentTools.get_business_context: Chroma retrieval failed (%s).",
+                type(exc).__name__,
+            )
             raise
 
         if context == "No business information found.":

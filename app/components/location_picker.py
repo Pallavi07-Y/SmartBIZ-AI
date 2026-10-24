@@ -9,5 +9,13 @@ _component = components.declare_component(
 )
 
 
-def location_picker(*, key, button_label="Use My Location"):
-    return _component(key=key, button_label=button_label, default=None)
+def location_picker(
+    *,
+    key,
+    button_label="Use My Location",
+):
+    return _component(
+        key=key,
+        button_label=button_label,
+        default=None,
+    )

@@ -77,6 +77,10 @@ class DocumentLoader:
                 "File not found"
             )
 
+        if path.stat().st_size > settings.max_upload_size_bytes:
+            raise ValueError(
+                f"Document exceeds the {settings.MAX_UPLOAD_SIZE_MB} MB upload limit."
+            )
 
         extension = path.suffix.lower()
 

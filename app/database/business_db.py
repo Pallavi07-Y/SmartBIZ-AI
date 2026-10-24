@@ -40,9 +40,6 @@ class BusinessDB:
                     "latitude": business.latitude,
                     "longitude": business.longitude,
                     "location_precision": business.location_precision,
-                    "owner_phone": business.owner_phone,
-                    "username": business.username,
-                    "password_hash": business.password_hash,
                     "created_at": business.created_at,
                 }
                 for business in businesses

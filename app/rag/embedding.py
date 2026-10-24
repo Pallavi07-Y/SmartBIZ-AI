@@ -24,7 +24,10 @@ class EmbeddingModel:
             ) from _sentence_transformers_error
 
         try:
-            self.model = SentenceTransformer(settings.EMBEDDING_MODEL)
+            self.model = SentenceTransformer(
+                settings.EMBEDDING_MODEL,
+                local_files_only=True,
+            )
             self.dimension = (
                 self.model.get_embedding_dimension()
                 or self.model.get_sentence_embedding_dimension()

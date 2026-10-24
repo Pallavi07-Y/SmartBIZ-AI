@@ -1,19 +1,30 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pytest
 
 from app.business.business_manager import BusinessController
-from app.database import Business, OtpVerification, get_session
+from app.database import Business, CustomerAccount, RateLimitEvent, get_session
 from app.utils.auth import (
-    generate_business_id,
+    authenticate_customer_account,
+    generate_account_id,
     hash_password,
+    normalize_email,
+    register_customer_account,
     verify_password,
-    generate_mock_otp,
-    hash_otp,
-    verify_otp,
-    issue_mock_otp,
-    verify_phone_otp,
 )
+from app.utils.time import utc_now_for_database
+
+
+def _register_shopkeeper(email="shopkeeper@example.com", password="shopkeeper-pass"):
+    business_id = generate_account_id("shopkeeper")
+    business = BusinessController().create_business(
+        name="Shopkeeper Test Shop",
+        category="Retail",
+        owner_email=email,
+        password=password,
+        business_id=business_id,
+    )
+    return business["business_id"]
 
 
 def test_password_hash_is_not_plaintext_and_verifies():
@@ -28,178 +39,297 @@ def test_verify_password_rejects_invalid_hash():
     assert verify_password("password", "not-a-bcrypt-hash") is False
 
 
+def test_account_ids_use_role_specific_prefixes_and_random_identifiers():
+    shopkeeper_id = generate_account_id("shopkeeper")
+    customer_id = generate_account_id("customer")
+
+    assert shopkeeper_id.startswith("SBZ-S-")
+    assert customer_id.startswith("SBZ-U-")
+    assert shopkeeper_id != generate_account_id("shopkeeper")
+    assert customer_id != generate_account_id("customer")
+
+
 def test_registration_passes_hashed_password(monkeypatch):
     controller = BusinessController.__new__(BusinessController)
 
     class FakeRegister:
-        def __init__(self):
-            self.received = None
-
         def register_business(self, *args, **kwargs):
             self.received = (args, kwargs)
-            return {"password_hash": kwargs["password_hash"]}
+            return {"business_id": "SBZ-S-TEST01"}
 
-    register = FakeRegister()
-    controller.register = register
-
+    controller.register = FakeRegister()
     result = controller.create_business(
         "Test Shop",
         "Electronics",
         password="shopkeeper-password",
     )
 
-    stored_hash = register.received[1]["password_hash"]
-    assert result["password_hash"] == stored_hash
+    stored_hash = controller.register.received[1]["password_hash"]
+    assert "password_hash" not in result
     assert stored_hash != "shopkeeper-password"
     assert verify_password("shopkeeper-password", stored_hash) is True
 
 
-def test_registration_creates_unique_business_id_and_hashes_password(isolated_database):
+def test_shopkeeper_can_login_with_email_or_account_id(isolated_database):
+    email = "shopkeeper@example.com"
+    shopkeeper_id = _register_shopkeeper(email)
     controller = BusinessController()
-    business = controller.create_business(
-        name="Alpha Electronics",
-        category="Electronics",
-        address="Main Road",
-        owner_phone="+919900000001",
-        username="alpha-owner",
-        password="secret-pass",
+
+    by_email = controller.authenticate_business(email.upper(), "shopkeeper-pass")
+    by_id = controller.authenticate_business(shopkeeper_id, "shopkeeper-pass")
+
+    assert by_email["business_id"] == shopkeeper_id
+    assert by_id["business_id"] == shopkeeper_id
+    assert by_email["role"] == by_id["role"] == "shopkeeper"
+    assert "password_hash" not in by_email
+
+
+def test_customer_can_login_with_email_or_account_id(isolated_database):
+    account = register_customer_account(
+        "Customer One",
+        "Customer@Example.com",
+        "customer-pass",
     )
 
-    assert business["business_id"].startswith("SB-")
-    assert len(business["business_id"]) == 9
-    assert business["password_hash"] != "secret-pass"
-    assert verify_password("secret-pass", business["password_hash"]) is True
+    by_email = authenticate_customer_account("customer@example.com", "customer-pass")
+    by_id = authenticate_customer_account(account["customer_id"], "customer-pass")
+
+    assert account["customer_id"].startswith("SBZ-U-")
+    assert by_email["customer_id"] == by_id["customer_id"] == account["customer_id"]
+    assert by_email["role"] == by_id["role"] == "customer"
+    assert "password_hash" not in by_email
+
+    session = get_session()
+    try:
+        stored = session.get(CustomerAccount, account["customer_id"])
+        assert stored.password_hash != "customer-pass"
+        assert stored.email == "customer@example.com"
+    finally:
+        session.close()
 
 
-def test_duplicate_phone_is_rejected(isolated_database):
+def test_unverified_accounts_cannot_authenticate(isolated_database):
+    business = BusinessController().register.register_business(
+        name="Unverified Shop",
+        category="Retail",
+        owner_email="unverified-shop@example.com",
+        username="unverified-shop",
+        password_hash=hash_password("shopkeeper-pass"),
+        email_verified=False,
+    )
+    customer = register_customer_account(
+        "Unverified Customer",
+        "unverified-customer@example.com",
+        "customer-pass",
+        email_verified=False,
+    )
+
+    assert BusinessController().authenticate_business(
+        business["business_id"],
+        "shopkeeper-pass",
+    ) is None
+    assert authenticate_customer_account(
+        customer["customer_id"],
+        "customer-pass",
+    ) is None
+
+
+@pytest.mark.parametrize("role", ["shopkeeper", "customer"])
+def test_invalid_password_is_rejected_for_each_role(isolated_database, role):
+    if role == "shopkeeper":
+        identifier = _register_shopkeeper()
+        assert BusinessController().authenticate_business(identifier, "incorrect-pass") is None
+    else:
+        account = register_customer_account(
+            "Customer Two",
+            "customer-two@example.com",
+            "customer-pass",
+        )
+        assert authenticate_customer_account(
+            account["customer_id"],
+            "incorrect-pass",
+        ) is None
+
+
+def test_account_role_separation_rejects_other_role_identifiers(isolated_database):
+    shopkeeper_id = _register_shopkeeper(
+        email="shop-owner@example.com",
+        password="same-password",
+    )
+    customer = register_customer_account(
+        "Customer Three",
+        "shop-customer@example.com",
+        "same-password",
+    )
+    controller = BusinessController()
+
+    assert controller.authenticate_business(
+        customer["customer_id"],
+        "same-password",
+    ) is None
+    assert authenticate_customer_account(
+        shopkeeper_id,
+        "same-password",
+    ) is None
+    assert authenticate_customer_account(
+        "shop-owner@example.com",
+        "same-password",
+    ) is None
+    assert controller.authenticate_business(
+        "shop-customer@example.com",
+        "same-password",
+    ) is None
+
+
+def test_duplicate_signup_email_is_rejected_across_roles(isolated_database):
+    _register_shopkeeper(email="shared@example.com")
+
+    with pytest.raises(ValueError, match="account already exists"):
+        register_customer_account(
+            "Duplicate Customer",
+            "SHARED@example.com",
+            "customer-pass",
+        )
+
+    register_customer_account(
+        "Unique Customer",
+        "unique@example.com",
+        "customer-pass",
+    )
+    with pytest.raises(ValueError, match="account already exists"):
+        _register_shopkeeper(email="UNIQUE@example.com")
+
+
+def test_duplicate_shopkeeper_email_is_rejected(isolated_database):
+    _register_shopkeeper(email="duplicate@example.com")
+
+    with pytest.raises(ValueError, match="email address"):
+        _register_shopkeeper(email="DUPLICATE@example.com")
+
+
+def test_customer_account_rejects_invalid_email_and_short_password(isolated_database):
+    with pytest.raises(ValueError, match="valid email"):
+        register_customer_account("Customer", "not-an-email", "customer-pass")
+    with pytest.raises(ValueError, match="8 characters"):
+        register_customer_account("Customer", "valid@example.com", "short")
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("owner@example.com", "owner@example.com"),
+        (" Owner@Example.COM ", "owner@example.com"),
+        ("invalid", ""),
+        ("owner@", ""),
+        ("owner@example", ""),
+        ("a b@example.com", ""),
+    ],
+)
+def test_normalize_email(value, expected):
+    assert normalize_email(value) == expected
+
+
+def test_login_lockout_and_success_reset_account_failures(isolated_database, monkeypatch):
+    from app.utils.auth import (
+        clear_login_failures,
+        login_lockout_remaining,
+        record_login_failure,
+    )
+
+    monkeypatch.setenv("LOGIN_ACCOUNT_ATTEMPT_LIMIT", "2")
+    now = utc_now_for_database()
+    for _ in range(2):
+        record_login_failure("SBZ-S-TEST01", "203.0.113.26", now=now)
+
+    assert login_lockout_remaining("SBZ-S-TEST01", "203.0.113.26", now=now) > 0
+    assert login_lockout_remaining(
+        "SBZ-S-TEST01",
+        "203.0.113.26",
+        now=now + timedelta(seconds=901),
+    ) == 0
+
+    clear_login_failures("SBZ-S-TEST01")
+    assert login_lockout_remaining("SBZ-S-TEST01", "203.0.113.26", now=now) == 0
+
+
+def test_login_ip_limit_applies_across_accounts(isolated_database, monkeypatch):
+    from app.utils.auth import login_lockout_remaining, record_login_failure
+
+    monkeypatch.setenv("LOGIN_IP_ATTEMPT_LIMIT", "1")
+    now = utc_now_for_database()
+    record_login_failure("SBZ-S-ACCOUNT1", "203.0.113.29", now=now)
+
+    assert login_lockout_remaining(
+        "SBZ-U-ACCOUNT2",
+        "203.0.113.29",
+        now=now,
+    ) > 0
+
+
+def test_login_failure_tracking_does_not_store_ip(isolated_database):
+    from app.utils.auth import record_login_failure
+
+    record_login_failure("SBZ-S-TEST02", "203.0.113.30")
+    session = get_session()
+    try:
+        subjects = [
+            row.subject_key
+            for row in session.query(RateLimitEvent).filter_by(
+                event_type="login_failure"
+            )
+        ]
+    finally:
+        session.close()
+
+    assert all("203.0.113.30" not in subject for subject in subjects)
+
+
+def test_login_failure_tracking_does_not_store_email_identifier(isolated_database):
+    from app.utils.auth import record_login_failure
+
+    record_login_failure("private@example.com")
+    session = get_session()
+    try:
+        subjects = [
+            row.subject_key
+            for row in session.query(RateLimitEvent).filter_by(
+                event_type="login_failure"
+            )
+        ]
+    finally:
+        session.close()
+
+    assert all("private@example.com" not in subject for subject in subjects)
+
+
+def test_duplicate_phone_is_still_rejected_for_legacy_business_registration(isolated_database):
     controller = BusinessController()
     controller.create_business(
         name="Alpha Electronics",
         category="Electronics",
         owner_phone="+919900000002",
         username="alpha-owner-1",
-        password="secret-pass",
+        password="alpha-pass",
     )
 
-    try:
+    with pytest.raises(ValueError, match="phone number"):
         controller.create_business(
             name="Beta Electronics",
             category="Electronics",
             owner_phone=" +91 9900 000002 ",
             username="beta-owner",
-            password="secret-pass-2",
+            password="beta-pass",
         )
-        assert False, "Expected duplicate phone registration to fail"
-    except ValueError:
-        pass
 
 
-def test_mock_otp_verification_flow_and_expiry():
-    otp_code = generate_mock_otp()
-    otp_hash = hash_otp(otp_code)
+def test_registration_result_does_not_expose_credentials(isolated_database):
+    business = _register_shopkeeper()
 
-    assert verify_otp(otp_code, otp_hash) is True
-    assert verify_otp("000000", otp_hash) is False
-    assert otp_code.isdigit()
-    assert len(otp_code) == 6
-
-
-def test_otp_resend_cooldown_and_new_code_revokes_verified_code(isolated_database):
-    phone = "+919900000005"
-    first_otp = issue_mock_otp(phone)
-    assert verify_phone_otp(phone, first_otp["otp_code"]) is True
-
-    with pytest.raises(ValueError, match="wait"):
-        issue_mock_otp(phone)
-
+    assert business.startswith("SBZ-S-")
     session = get_session()
     try:
-        record = session.query(OtpVerification).filter_by(phone_number="919900000005").one()
-        record.last_sent_at = datetime.utcnow() - timedelta(seconds=31)
-        session.commit()
+        registered = session.get(Business, business)
+        assert registered.password_hash != "shopkeeper-pass"
+        assert verify_password("shopkeeper-pass", registered.password_hash)
     finally:
         session.close()
-
-    second_otp = issue_mock_otp(phone)
-    session = get_session()
-    try:
-        record = session.query(OtpVerification).filter_by(phone_number="919900000005").one()
-        assert record.verified_at is None
-    finally:
-        session.close()
-
-    assert verify_phone_otp(phone, first_otp["otp_code"]) is False
-    assert verify_phone_otp(phone, second_otp["otp_code"]) is True
-
-
-def test_expired_otp_is_rejected_and_removed(isolated_database):
-    phone = "+919900000006"
-    otp = issue_mock_otp(phone, ttl_seconds=-1)
-
-    assert verify_phone_otp(phone, otp["otp_code"]) is False
-
-    session = get_session()
-    try:
-        assert session.query(OtpVerification).filter_by(phone_number="919900000006").first() is None
-    finally:
-        session.close()
-
-
-def test_otp_attempt_limit_rejects_later_correct_code(isolated_database):
-    phone = "+919900000007"
-    otp = issue_mock_otp(phone)
-
-    for _ in range(5):
-        assert verify_phone_otp(phone, "000000") is False
-
-    assert verify_phone_otp(phone, otp["otp_code"]) is False
-
-
-def test_business_id_generator_returns_unique_pattern():
-    first = generate_business_id()
-    second = generate_business_id()
-
-    assert first.startswith("SB-")
-    assert second.startswith("SB-")
-    assert first != second
-
-
-def test_shopkeeper_login_uses_business_id_and_password(isolated_database):
-    controller = BusinessController()
-    created = controller.create_business(
-        name="Welcome Shop",
-        category="Home Goods",
-        owner_phone="+919900000003",
-        username="welcome-owner",
-        password="correct-pass",
-    )
-
-    session = get_session()
-    business = session.query(Business).filter(Business.business_id == created["business_id"]).first()
-    session.close()
-
-    assert business is not None
-    assert business.business_id == created["business_id"]
-    assert verify_password("correct-pass", business.password_hash) is True
-
-
-def test_invalid_login_and_logout_session_clear(isolated_database):
-    controller = BusinessController()
-    created = controller.create_business(
-        name="Session Shop",
-        category="Retail",
-        owner_phone="+919900000004",
-        username="session-owner",
-        password="right-pass",
-    )
-
-    session = get_session()
-    business = session.query(Business).filter(Business.business_id == created["business_id"]).first()
-    session.close()
-
-    assert business is not None
-    assert verify_password("wrong-pass", business.password_hash) is False
-
-    auth_state = {"business_id": business.business_id, "role": "shopkeeper"}
-    auth_state.clear()
-    assert auth_state == {}

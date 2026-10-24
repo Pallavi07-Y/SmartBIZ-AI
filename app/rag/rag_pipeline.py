@@ -156,10 +156,7 @@ class RAGPipeline:
     def _filter_documents_for_query(self, document_distances, query):
         threshold = self._choose_distance_threshold(document_distances, query)
         if threshold is None:
-            logger.debug(
-                "No semantically relevant documents found for query='%s'.",
-                query[:80].strip(),
-            )
+            logger.debug("No semantically relevant documents found.")
             return []
 
         unique_documents = []
@@ -203,8 +200,8 @@ class RAGPipeline:
         if not relevant_documents:
             return "No business information found."
 
-        for index, (document, distance) in enumerate(relevant_documents, start=1):
-            logger.debug("Retrieved chunk %s (cosine distance=%s): %s", index, distance, document[:200])
+        for index, (_, distance) in enumerate(relevant_documents, start=1):
+            logger.debug("Retrieved chunk %s (cosine distance=%s).", index, distance)
 
         return "\n\n".join(document for document, _ in relevant_documents)
 

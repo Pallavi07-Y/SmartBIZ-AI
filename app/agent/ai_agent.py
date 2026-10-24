@@ -16,6 +16,7 @@ from app.llm.llm import LLM
 from app.notifications.notification_service import create_notification
 from app.prompts.system_prompt import SYSTEM_PROMPT
 from app.utils.logger import logger
+from app.utils.time import utc_now_for_database
 
 
 class AIAgent:
@@ -180,7 +181,10 @@ class AIAgent:
                 "business policies, product descriptions, and customer service knowledge",
             )
         except Exception as exc:
-            logger.warning("Business insight RAG context unavailable for %s: %s", business_id, exc)
+            logger.warning(
+                "Business insight RAG context unavailable (%s).",
+                type(exc).__name__,
+            )
             knowledge_context = None
         user_payload = {
             "verified_metrics": metrics,
@@ -435,7 +439,7 @@ class AIAgent:
             ).first()
             if conversation is not None:
                 conversation.order_state = dict(state)
-                conversation.updated_at = datetime.utcnow()
+                conversation.updated_at = utc_now_for_database()
                 session.commit()
         except Exception:
             session.rollback()
@@ -864,7 +868,7 @@ class AIAgent:
                     sender=MessageSender.AI,
                     text=response,
                 ))
-            conversation.updated_at = datetime.utcnow()
+            conversation.updated_at = utc_now_for_database()
             session.commit()
         except Exception:
             session.rollback()
@@ -1212,7 +1216,10 @@ class AIAgent:
                     try:
                         context = self.tools.get_business_context(business_id, resolved_query)
                     except Exception as exc:
-                        logger.warning("Customer product context unavailable for %s: %s", business_id, exc)
+                        logger.warning(
+                            "Customer product context unavailable (%s).",
+                            type(exc).__name__,
+                        )
                 payload = {
                     "live_products_from_sqlite": matches,
                     "shop_knowledge_context": context or "No additional shop knowledge was retrieved.",
@@ -1263,10 +1270,8 @@ class AIAgent:
             """
 
             is_business_query = self.tools.rag.is_business_query(resolved_query)
-            logger.debug("Original Query: %s", user_query)
             logger.debug("Is Business Query: %s", is_business_query)
-            logger.debug("Resolved Retrieval Query: %s", resolved_query)
-            logger.debug("Retrieval Query Text: %s", retrieval_query)
+            logger.debug("Prepared business retrieval query.")
 
             if not is_business_query:
                 messages = [
@@ -1290,7 +1295,7 @@ class AIAgent:
 
                 context = "No business information found."
 
-            logger.debug("Retrieved Context: %s", context)
+            logger.debug("Retrieved business context.")
 
 
             # Store user message

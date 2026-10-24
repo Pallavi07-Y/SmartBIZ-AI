@@ -1,5 +1,7 @@
 from app.business.register_business import BusinessManager
-from app.utils.auth import hash_password, normalize_phone, verify_password
+from sqlalchemy import or_
+
+from app.utils.auth import hash_password, normalize_email, normalize_phone, verify_password
 from app.business.upload_documents import DocumentUploader
 from app.business.search_business import BusinessSearch
 from app.database import Business, KnowledgeDocument, Product, get_session
@@ -28,6 +30,8 @@ class BusinessController:
         business_id=None,
         latitude=None,
         longitude=None,
+        owner_email=None,
+        email_verified=True,
     ):
 
         return self.register.register_business(
@@ -41,18 +45,29 @@ class BusinessController:
             business_id=business_id,
             latitude=latitude,
             longitude=longitude,
+            owner_email=owner_email,
+            email_verified=email_verified,
         )
 
-    def authenticate_business(self, business_id, password):
-        if not business_id or not password:
+    def authenticate_business(self, identifier, password):
+        if not identifier or not password:
             return None
 
+        identifier = str(identifier).strip()
+        normalized_email = normalize_email(identifier)
         session = get_session()
         try:
-            business = session.query(Business).filter(Business.business_id == str(business_id).strip()).first()
+            account_filters = [Business.business_id == identifier]
+            if normalized_email:
+                account_filters.append(Business.owner_email == normalized_email)
+            business = session.query(Business).filter(or_(*account_filters)).first()
             if business is None:
                 return None
-            if not business.password_hash or not verify_password(password, business.password_hash):
+            if (
+                not business.email_verified
+                or not business.password_hash
+                or not verify_password(password, business.password_hash)
+            ):
                 return None
             return {
                 "business_id": business.business_id,
@@ -63,7 +78,6 @@ class BusinessController:
                 "latitude": business.latitude,
                 "longitude": business.longitude,
                 "location_precision": business.location_precision,
-                "owner_phone": business.owner_phone,
                 "role": "shopkeeper",
             }
         finally:

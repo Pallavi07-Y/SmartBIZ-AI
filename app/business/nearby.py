@@ -3,7 +3,7 @@ import time
 
 import requests
 
-from app.database import Business, Product, get_session
+from app.database import Business, CustomerAccount, Product, get_session
 from app.database.business_db import BusinessDB
 from app.utils.location import distance, validate_coordinates
 
@@ -220,7 +220,7 @@ def search_nearby_shops(latitude=None, longitude=None, *, location_query=None, r
 
 
 def save_shop_coordinates(business_id, latitude, longitude):
-    latitude, longitude = _optional_coordinates(latitude, longitude)
+    latitude, longitude = validate_optional_coordinates(latitude, longitude)
 
     session = get_session()
     try:
@@ -238,7 +238,7 @@ def save_shop_coordinates(business_id, latitude, longitude):
         session.close()
 
 
-def _optional_coordinates(latitude, longitude):
+def validate_optional_coordinates(latitude, longitude):
     latitude_missing = latitude is None or str(latitude).strip() == ""
     longitude_missing = longitude is None or str(longitude).strip() == ""
     if latitude_missing and longitude_missing:
@@ -249,7 +249,7 @@ def _optional_coordinates(latitude, longitude):
 
 
 def save_shop_location(business_id, address, latitude, longitude):
-    latitude, longitude = _optional_coordinates(latitude, longitude)
+    latitude, longitude = validate_optional_coordinates(latitude, longitude)
     address = (address or "").strip()
     if not address:
         raise ValueError("Enter the shop address.")
@@ -267,6 +267,63 @@ def save_shop_location(business_id, address, latitude, longitude):
     except Exception:
         session.rollback()
         raise
+    finally:
+        session.close()
+
+
+def save_shop_address(business_id, address):
+    address = (address or "").strip()
+    if not address:
+        raise ValueError("Enter the shop address.")
+
+    session = get_session()
+    try:
+        business = session.get(Business, business_id)
+        if business is None:
+            raise ValueError("Shop not found.")
+        business.address = address
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def save_customer_location(customer_id, address, latitude, longitude):
+    latitude, longitude = validate_optional_coordinates(latitude, longitude)
+    address = (address or "").strip()
+
+    session = get_session()
+    try:
+        customer = session.get(CustomerAccount, customer_id)
+        if customer is None:
+            raise ValueError("Customer account not found.")
+        if address:
+            customer.delivery_address = address
+        customer.latitude = latitude
+        customer.longitude = longitude
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def get_customer_saved_location(customer_id):
+    if not customer_id:
+        return None
+    session = get_session()
+    try:
+        customer = session.get(CustomerAccount, customer_id)
+        if customer is None:
+            return None
+        return {
+            "address": customer.delivery_address,
+            "latitude": customer.latitude,
+            "longitude": customer.longitude,
+        }
     finally:
         session.close()
 

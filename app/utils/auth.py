@@ -1,9 +1,23 @@
 import hashlib
+import ipaddress
+import logging
+import re
 import secrets
 import string
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import bcrypt
+
+from app.config import settings
+from app.utils.time import utc_now_for_database
+
+
+logger = logging.getLogger(__name__)
+EMAIL_PATTERN = re.compile(
+    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+"
+)
 
 
 def hash_password(password):
@@ -36,108 +50,210 @@ def normalize_phone(phone):
     return digits
 
 
+def normalize_email(email):
+    if not isinstance(email, str):
+        return ""
+    normalized_email = email.strip().casefold()
+    if not EMAIL_PATTERN.fullmatch(normalized_email):
+        return ""
+    return normalized_email
+
+
 def generate_business_id():
     alphabet = string.ascii_uppercase + string.digits
     suffix = "".join(secrets.choice(alphabet) for _ in range(6))
     return f"SB-{suffix}"
 
 
-def generate_mock_otp(length=6):
-    return "".join(secrets.choice(string.digits) for _ in range(length))
+def generate_account_id(role):
+    prefixes = {"customer": "SBZ-U", "shopkeeper": "SBZ-S"}
+    try:
+        prefix = prefixes[role]
+    except KeyError as exc:
+        raise ValueError("Unsupported account role.") from exc
+    return f"{prefix}-{secrets.token_hex(6).upper()}"
 
 
-def hash_otp(otp):
-    if not isinstance(otp, str):
-        return ""
-    return hashlib.sha256(otp.strip().encode("utf-8")).hexdigest()
+def register_customer_account(name, email, password, *, email_verified=True):
+    from app.database import Business, CustomerAccount, get_session
 
-
-def verify_otp(candidate, expected_hash):
-    if not isinstance(candidate, str) or not isinstance(expected_hash, str):
-        return False
-    return hash_otp(candidate) == expected_hash
-
-
-def issue_mock_otp(phone_number, *, ttl_seconds=300, cooldown_seconds=30):
-    if not isinstance(phone_number, str):
-        raise TypeError("Phone number must be a string.")
-
-    from app.database import OtpVerification, get_session
-
-    normalized_phone = normalize_phone(phone_number)
-    if not normalized_phone:
-        raise ValueError("Phone number is required.")
-
-    otp_code = generate_mock_otp()
-    otp_hash = hash_otp(otp_code)
-    now = datetime.utcnow()
+    normalized_email = normalize_email(email)
+    if not normalized_email:
+        raise ValueError("Enter a valid email address.")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Enter your name.")
+    if not isinstance(password, str) or len(password) < 8:
+        raise ValueError("Password must be at least 8 characters long.")
 
     session = get_session()
     try:
-        otp_record = session.query(OtpVerification).filter(OtpVerification.phone_number == normalized_phone).first()
-        if (
-            otp_record is not None
-            and otp_record.last_sent_at is not None
-            and now - otp_record.last_sent_at < timedelta(seconds=cooldown_seconds)
-        ):
-            raise ValueError("Please wait before requesting a new OTP.")
-        if otp_record is None:
-            otp_record = OtpVerification(
-                phone_number=normalized_phone,
-                otp_hash=otp_hash,
-                expires_at=now + timedelta(seconds=ttl_seconds),
-                attempts_used=0,
-                max_attempts=5,
-                last_sent_at=now,
-            )
-            session.add(otp_record)
-        else:
-            otp_record.otp_hash = otp_hash
-            otp_record.expires_at = now + timedelta(seconds=ttl_seconds)
-            otp_record.attempts_used = 0
-            otp_record.max_attempts = 5
-            otp_record.last_sent_at = now
-            otp_record.verified_at = None
+        existing_business_email = session.query(Business.business_id).filter(
+            Business.owner_email == normalized_email
+        ).first()
+        existing_customer = session.query(CustomerAccount.customer_id).filter(
+            CustomerAccount.email == normalized_email
+        ).first()
+        if existing_business_email or existing_customer:
+            raise ValueError("An account already exists for this email address.")
 
+        customer_id = generate_account_id("customer")
+        while session.query(CustomerAccount.customer_id).filter(
+            CustomerAccount.customer_id == customer_id
+        ).first():
+            customer_id = generate_account_id("customer")
+
+        account = CustomerAccount(
+            customer_id=customer_id,
+            name=name.strip(),
+            email=normalized_email,
+            email_verified=bool(email_verified),
+            password_hash=hash_password(password),
+        )
+        session.add(account)
         session.commit()
+        return {"customer_id": account.customer_id, "name": account.name}
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def authenticate_customer_account(identifier, password):
+    from sqlalchemy import or_
+
+    from app.database import CustomerAccount, get_session
+
+    if not isinstance(identifier, str) or not isinstance(password, str):
+        return None
+    cleaned_identifier = identifier.strip()
+    if not cleaned_identifier:
+        return None
+    normalized_email = normalize_email(cleaned_identifier)
+
+    session = get_session()
+    try:
+        predicates = [CustomerAccount.customer_id == cleaned_identifier]
+        if normalized_email:
+            predicates.append(CustomerAccount.email == normalized_email)
+        account = session.query(CustomerAccount).filter(or_(*predicates)).first()
+        if (
+            account is None
+            or not account.email_verified
+            or not verify_password(password, account.password_hash)
+        ):
+            return None
         return {
-            "otp_code": otp_code,
-            "phone_number": normalized_phone,
-            "expires_at": otp_record.expires_at,
-            "attempts_used": otp_record.attempts_used,
-            "max_attempts": otp_record.max_attempts,
+            "customer_id": account.customer_id,
+            "name": account.name,
+            "role": "customer",
         }
     finally:
         session.close()
 
 
-def verify_phone_otp(phone_number, candidate_otp, *, max_attempts=5):
-    from app.database import OtpVerification, get_session
+def _ip_subject_key(client_ip):
+    if not isinstance(client_ip, str) or not client_ip.strip():
+        return None
+    try:
+        normalized_ip = ipaddress.ip_address(client_ip.strip()).compressed
+    except ValueError:
+        return None
+    return f"ip:{hashlib.sha256(normalized_ip.encode('utf-8')).hexdigest()}"
 
-    normalized_phone = normalize_phone(phone_number)
-    if not normalized_phone:
-        return False
+
+def _account_subject_key(identifier):
+    normalized_identifier = str(identifier).strip()
+    normalized_email = normalize_email(normalized_identifier)
+    if normalized_email:
+        normalized_identifier = normalized_email
+    digest = hashlib.sha256(normalized_identifier.encode("utf-8")).hexdigest()
+    return f"account:{digest}"
+
+
+def _record_rate_events(session, event_type, subject_keys, occurred_at):
+    from app.database import RateLimitEvent
+
+    session.add_all(
+        RateLimitEvent(
+            event_type=event_type,
+            subject_key=subject_key,
+            created_at=occurred_at,
+        )
+        for subject_key in subject_keys
+        if subject_key
+    )
+
+
+def login_lockout_remaining(business_id, client_ip=None, *, now=None):
+    from app.database import RateLimitEvent, get_session
+
+    now = now or utc_now_for_database()
+    cutoff = now - timedelta(seconds=settings.login_window_seconds)
+    subjects = [
+        (_account_subject_key(business_id), settings.login_account_attempt_limit),
+    ]
+    ip_key = _ip_subject_key(client_ip)
+    if ip_key:
+        subjects.append((ip_key, settings.login_ip_attempt_limit))
 
     session = get_session()
     try:
-        otp_record = session.query(OtpVerification).filter(OtpVerification.phone_number == normalized_phone).first()
-        if otp_record is None:
-            return False
-        if otp_record.expires_at <= datetime.utcnow():
-            session.delete(otp_record)
-            session.commit()
-            return False
-        if otp_record.attempts_used >= max_attempts:
-            return False
+        remaining = 0
+        for subject_key, attempt_limit in subjects:
+            attempts = (
+                session.query(RateLimitEvent)
+                .filter(
+                    RateLimitEvent.event_type == "login_failure",
+                    RateLimitEvent.subject_key == subject_key,
+                    RateLimitEvent.created_at >= cutoff,
+                )
+                .order_by(RateLimitEvent.created_at.asc())
+                .all()
+            )
+            if len(attempts) >= attempt_limit:
+                unlock_at = attempts[-1].created_at + timedelta(seconds=settings.login_lockout_seconds)
+                remaining = max(remaining, int((unlock_at - now).total_seconds()))
+        return max(0, remaining)
+    finally:
+        session.close()
 
-        is_valid = verify_otp(candidate_otp, otp_record.otp_hash)
-        otp_record.attempts_used += 1
-        if is_valid:
-            otp_record.verified_at = datetime.utcnow()
-            session.commit()
-            return True
 
+def record_login_failure(business_id, client_ip=None, *, now=None):
+    from app.database import RateLimitEvent, get_session
+
+    now = now or utc_now_for_database()
+    subjects = [_account_subject_key(business_id)]
+    ip_key = _ip_subject_key(client_ip)
+    if ip_key:
+        subjects.append(ip_key)
+
+    session = get_session()
+    try:
+        session.query(RateLimitEvent).filter(
+            RateLimitEvent.created_at < now - timedelta(days=1)
+        ).delete(synchronize_session=False)
+        _record_rate_events(session, "login_failure", subjects, now)
         session.commit()
-        return False
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def clear_login_failures(business_id):
+    from app.database import RateLimitEvent, get_session
+
+    session = get_session()
+    try:
+        session.query(RateLimitEvent).filter(
+            RateLimitEvent.event_type == "login_failure",
+            RateLimitEvent.subject_key == _account_subject_key(business_id),
+        ).delete(synchronize_session=False)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()

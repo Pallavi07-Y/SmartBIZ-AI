@@ -1,3 +1,5 @@
+import html
+import ipaddress
 import json
 import re
 import secrets
@@ -11,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import streamlit as st
+from sqlalchemy import or_
 
 from app.agent.tools import AgentTools
 from app.agent.ai_agent import AIAgent
@@ -22,16 +25,19 @@ from app.business.search_business import BusinessSearch
 from app.business.nearby import (
     LocationLookupError,
     geocode_place,
+    get_customer_saved_location,
     reverse_geocode,
-    save_shop_coordinates,
+    save_shop_address,
     save_shop_location,
+    save_customer_location,
     search_nearby_shops,
+    validate_optional_coordinates,
     validate_coordinates,
 )
 from app.components.location_picker import location_picker
 from app.database import (
     Business,
-    OtpVerification,
+    CustomerAccount,
     Conversation,
     ConversationStatus,
     KnowledgeDocument,
@@ -47,13 +53,24 @@ from app.database import (
 from app.config import settings
 from app.notifications.notification_service import create_notification, get_notifications_for_business as _get_notifications_for_business, get_unread_count as _get_unread_count, mark_all_as_read as _mark_all_as_read, mark_as_read as _mark_as_read
 from app.utils.auth import (
+    authenticate_customer_account,
+    clear_login_failures,
+    generate_account_id,
     hash_password,
-    issue_mock_otp,
+    login_lockout_remaining,
+    normalize_email,
     normalize_phone,
+    record_login_failure,
+    register_customer_account,
     verify_password,
-    verify_phone_otp,
+)
+from app.utils.email_verification import (
+    EmailVerificationError,
+    send_email_verification_code,
+    verify_email_verification_code,
 )
 from app.utils.logger import logger
+from app.utils.time import utc_now_for_database
 
 
 configure_database()
@@ -98,7 +115,7 @@ def save_shopkeeper_reply(business_id, conversation_id, reply_text):
             raise ValueError("Conversation not found for this business.")
 
         conversation.status = ConversationStatus.KEEPER_HANDLING
-        conversation.updated_at = datetime.utcnow()
+        conversation.updated_at = utc_now_for_database()
 
         message = Message(
             conversation_id=conversation.id,
@@ -113,6 +130,81 @@ def save_shopkeeper_reply(business_id, conversation_id, reply_text):
         raise
     finally:
         session.close()
+
+
+def _client_ip():
+    client_ip = getattr(st.context, "ip_address", None)
+    if not isinstance(client_ip, str):
+        return None
+    try:
+        return ipaddress.ip_address(client_ip).compressed
+    except ValueError:
+        return None
+
+
+def _rate_limit_device_id():
+    return st.session_state.setdefault(
+        "rate_limit_device_id",
+        secrets.token_urlsafe(24),
+    )
+
+
+def _safe_html_text(value):
+    return html.escape(str(value or ""), quote=True)
+
+
+def _email_already_registered(email):
+    session = get_session()
+    try:
+        return bool(
+            session.query(Business.business_id)
+            .filter(Business.owner_email == email)
+            .first()
+            or session.query(CustomerAccount.customer_id)
+            .filter(CustomerAccount.email == email)
+            .first()
+        )
+    finally:
+        session.close()
+
+
+def _render_email_verification(email, prefix, verified_state_key):
+    expiry_minutes = max(1, settings.email_otp_ttl_seconds // 60)
+    st.caption(
+        f"Enter the six-digit code sent to {email}. "
+        f"The code expires after {expiry_minutes} minutes."
+    )
+    with st.form(f"{prefix}_verification_form"):
+        code = st.text_input("Email verification code", max_chars=6)
+        submitted = st.form_submit_button("VERIFY EMAIL", use_container_width=True)
+    if submitted:
+        try:
+            if verify_email_verification_code(email, code):
+                st.session_state[verified_state_key] = email
+                st.success("Email verified.")
+                st.rerun()
+            st.error("That code is invalid or expired. Request a new code and try again.")
+        except EmailVerificationError as exc:
+            st.error(str(exc))
+
+    if st.button("Resend verification email", key=f"{prefix}_resend_code"):
+        try:
+            send_email_verification_code(email, _client_ip())
+        except EmailVerificationError as exc:
+            st.error(str(exc))
+        else:
+            st.success("A new verification email has been sent.")
+
+    return st.button("Use a different email", key=f"{prefix}_change_email")
+
+
+def _validate_upload_size(size_bytes):
+    if not isinstance(size_bytes, int) or size_bytes < 0:
+        raise ValueError("Unable to determine the uploaded file size.")
+    if size_bytes > settings.max_upload_size_bytes:
+        raise ValueError(
+            f"File exceeds the {settings.MAX_UPLOAD_SIZE_MB} MB upload limit."
+        )
 
 
 def get_orders_for_business(business_id):
@@ -163,8 +255,6 @@ def get_customer_business(business_id):
             "address": business.address,
             "latitude": business.latitude,
             "longitude": business.longitude,
-            "owner_phone": business.owner_phone,
-            "username": business.username,
             "created_at": business.created_at,
         }
     finally:
@@ -1317,112 +1407,146 @@ def _items_to_text(items):
     return ", ".join(text_items)
 
 
+def _show_customer_signup_page():
+    st.markdown("<div class='auth-shell'><div class='auth-inner'>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='auth-brand'><h1>WELCOME TO SMARTBIZ AI</h1>"
+        "<h2>Business Automation System</h2></div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div class='auth-card'>", unsafe_allow_html=True)
+    st.markdown("<div class='auth-headline'>Create Customer Account</div>", unsafe_allow_html=True)
+
+    customer_id = st.session_state.get("signup_success_customer_id")
+    if customer_id:
+        st.markdown("<div class='auth-subtitle'>Account Created</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='auth-subtitle'>Your Customer Account ID: "
+            f"<strong>{customer_id}</strong></div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div class='micro-copy'>Save this ID. You can also log in with your email.</div>", unsafe_allow_html=True)
+        if st.button("GO TO LOGIN", use_container_width=True):
+            st.session_state.auth_mode = "login"
+            st.session_state.pop("signup_success_customer_id", None)
+            st.rerun()
+    else:
+        pending_email = st.session_state.get("customer_signup_pending_email")
+        verified_email = st.session_state.get("customer_signup_verified_email")
+        signup_email = st.session_state.get("customer_signup_email", "")
+        if pending_email and verified_email != pending_email:
+            st.markdown("<div class='auth-subtitle'>Verify your email</div>", unsafe_allow_html=True)
+            change_email = _render_email_verification(
+                pending_email,
+                "customer_signup",
+                "customer_signup_verified_email",
+            )
+            if change_email:
+                for key in (
+                    "customer_signup_email",
+                    "customer_signup_name",
+                    "customer_signup_pending_email",
+                    "customer_signup_verified_email",
+                ):
+                    st.session_state.pop(key, None)
+                st.rerun()
+        elif verified_email and verified_email == signup_email:
+            st.markdown("<div class='auth-subtitle'>Email verified. Create your password.</div>", unsafe_allow_html=True)
+            with st.form("customer_signup_password_form"):
+                password = st.text_input("Create Password", type="password")
+                confirm_password = st.text_input("Confirm Password", type="password")
+                submitted = st.form_submit_button("CREATE CUSTOMER ACCOUNT", use_container_width=True)
+            if submitted:
+                if len(password) < 8:
+                    st.error("Password must be at least 8 characters long.")
+                elif password != confirm_password:
+                    st.error("Passwords do not match.")
+                else:
+                    try:
+                        account = register_customer_account(
+                            st.session_state.get("customer_signup_name", ""),
+                            verified_email,
+                            password,
+                            email_verified=True,
+                        )
+                        st.session_state.signup_success_customer_id = account["customer_id"]
+                        st.session_state.pop("customer_signup_pending_email", None)
+                        st.session_state.pop("customer_signup_verified_email", None)
+                        st.session_state.pop("customer_signup_email", None)
+                        st.session_state.pop("customer_signup_name", None)
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    except Exception:
+                        st.error("Unable to create your account right now.")
+        else:
+            with st.form("customer_signup_form"):
+                name = st.text_input(
+                    "Full Name",
+                    value=st.session_state.get("customer_signup_name", ""),
+                )
+                email = st.text_input(
+                    "Email Address",
+                    value=st.session_state.get("customer_signup_email", ""),
+                )
+                submitted = st.form_submit_button("VERIFY EMAIL", use_container_width=True)
+            if submitted:
+                normalized_email = normalize_email(email)
+                if not normalized_email:
+                    st.error("Please enter a valid email address.")
+                elif not name.strip():
+                    st.error("Please enter your name.")
+                elif _email_already_registered(normalized_email):
+                    st.error("An account already exists for this email address.")
+                else:
+                    try:
+                        send_email_verification_code(normalized_email, _client_ip())
+                    except EmailVerificationError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.session_state.customer_signup_name = name.strip()
+                        st.session_state.customer_signup_email = normalized_email
+                        st.session_state.customer_signup_pending_email = normalized_email
+                        st.rerun()
+
+    if not customer_id and st.button("Back to login", use_container_width=True):
+        st.session_state.auth_mode = "login"
+        for key in (
+            "customer_signup_email",
+            "customer_signup_name",
+            "customer_signup_pending_email",
+            "customer_signup_verified_email",
+        ):
+            st.session_state.pop(key, None)
+        st.rerun()
+    st.markdown("</div></div></div>", unsafe_allow_html=True)
+
+
 def _show_signup_page():
+    if st.session_state.get("role") == "customer":
+        _show_customer_signup_page()
+        return
+
     st.markdown("<div class='auth-shell'><div class='auth-inner'>", unsafe_allow_html=True)
     st.markdown("<div class='auth-brand'><h1>WELCOME TO SMARTBIZ AI</h1><h2>Business Automation System</h2></div>", unsafe_allow_html=True)
 
     if "signup_step" not in st.session_state:
-        st.session_state.signup_step = "phone"
-    if "signup_phone" not in st.session_state:
-        st.session_state.signup_phone = ""
-    if "signup_otp_attempts" not in st.session_state:
-        st.session_state.signup_otp_attempts = 0
-    if "signup_otp_expires_at" not in st.session_state:
-        st.session_state.signup_otp_expires_at = None
-    if "signup_resend_cooldown_until" not in st.session_state:
-        st.session_state.signup_resend_cooldown_until = None
+        st.session_state.signup_step = "details"
+    if st.session_state.signup_step in {"phone", "email", "otp"}:
+        st.session_state.signup_step = "details"
+    if "signup_email" not in st.session_state:
+        st.session_state.signup_email = ""
+    if "signup_latitude" not in st.session_state:
+        st.session_state.signup_latitude = None
+    if "signup_longitude" not in st.session_state:
+        st.session_state.signup_longitude = None
 
     step = st.session_state.signup_step
     st.markdown("<div class='auth-card'>", unsafe_allow_html=True)
-
-    if step == "phone":
-        st.markdown("<div class='auth-headline'>Create Shopkeeper Account</div>", unsafe_allow_html=True)
-        st.markdown("<div class='auth-subtitle'>Step 1 of 4</div>", unsafe_allow_html=True)
-        with st.form("shop_phone_form"):
-            phone = st.text_input("Phone Number", value=st.session_state.signup_phone, placeholder="+91 Enter phone number")
-            submitted = st.form_submit_button("SEND OTP", use_container_width=True)
-        if submitted:
-            normalized_phone = normalize_phone(phone)
-            if not normalized_phone:
-                st.error("Please enter a valid phone number.")
-            else:
-                session = get_session()
-                try:
-                    existing = session.query(Business).filter(Business.owner_phone == normalized_phone).first()
-                    if existing is not None:
-                        st.error("This phone number is already registered. Please use another phone number or login with your existing business ID.")
-                    else:
-                        otp_result = issue_mock_otp(normalized_phone)
-                        st.session_state.signup_phone = normalized_phone
-                        st.session_state.signup_otp_attempts = 0
-                        st.session_state.signup_otp_expires_at = otp_result["expires_at"]
-                        st.session_state.signup_mock_otp = otp_result["otp_code"]
-                        st.session_state.signup_step = "otp"
-                        st.session_state.signup_resend_cooldown_until = datetime.utcnow() + timedelta(seconds=30)
-                        st.success("OTP sent successfully.")
-                        st.info(f"Mock OTP for development: {otp_result['otp_code']}")
-                        st.rerun()
-                except ValueError as exc:
-                    st.warning(str(exc))
-                finally:
-                    session.close()
-
-    elif step == "otp":
-        st.markdown("<div class='auth-headline'>Verify OTP</div>", unsafe_allow_html=True)
-        st.markdown("<div class='auth-subtitle'>Step 2 of 4</div>", unsafe_allow_html=True)
-        expires_at = st.session_state.get("signup_otp_expires_at")
-        if expires_at is not None:
-            seconds_left = max(0, int((expires_at - datetime.utcnow()).total_seconds()))
-            st.markdown(f"<div class='micro-copy'>OTP expires in {seconds_left} seconds</div>", unsafe_allow_html=True)
-        st.info(f"Demo OTP: {st.session_state.get('signup_mock_otp', '****')}")
-        with st.form("shop_otp_form"):
-            otp = st.text_input("Enter OTP", max_chars=6, placeholder="_ _ _ _ _ _")
-            submitted = st.form_submit_button("VERIFY OTP", use_container_width=True)
-
-        if submitted:
-            if not otp:
-                st.error("Please enter the OTP.")
-            else:
-                if expires_at is not None and expires_at <= datetime.utcnow():
-                    st.error("This OTP has expired. Please request a new one.")
-                    st.session_state.signup_step = "phone"
-                    st.rerun()
-                else:
-                    if verify_phone_otp(st.session_state.signup_phone, otp):
-                        st.session_state.signup_step = "details"
-                        st.session_state.signup_otp_attempts = 0
-                        st.success("Phone verified successfully.")
-                        st.rerun()
-                    else:
-                        st.session_state.signup_otp_attempts += 1
-                        if st.session_state.signup_otp_attempts >= 5:
-                            st.error("Too many failed attempts. Please request a new OTP.")
-                            st.session_state.signup_step = "phone"
-                            st.rerun()
-                        else:
-                            remaining = 5 - st.session_state.signup_otp_attempts
-                            st.error(f"Invalid OTP. {remaining} attempt(s) remaining.")
-
-        cooldown_until = st.session_state.get("signup_resend_cooldown_until")
-        cooldown_active = bool(cooldown_until and datetime.utcnow() < cooldown_until)
-        if cooldown_active:
-            st.caption(f"You can request another OTP in {int((cooldown_until - datetime.utcnow()).total_seconds())} seconds.")
-        if st.button("RESEND OTP", use_container_width=True, disabled=cooldown_active):
-            try:
-                otp_result = issue_mock_otp(st.session_state.signup_phone)
-                st.session_state.signup_otp_expires_at = otp_result["expires_at"]
-                st.session_state.signup_mock_otp = otp_result["otp_code"]
-                st.session_state.signup_otp_attempts = 0
-                st.session_state.signup_resend_cooldown_until = datetime.utcnow() + timedelta(seconds=30)
-                st.success("A new OTP has been sent.")
-                st.info(f"Mock OTP for development: {otp_result['otp_code']}")
-                st.rerun()
-            except ValueError as exc:
-                st.warning(str(exc))
-
-    elif step == "details":
+    if step == "details":
         st.markdown("<div class='auth-headline'>Business Details</div>", unsafe_allow_html=True)
-        st.markdown("<div class='auth-subtitle'>Step 3 of 4</div>", unsafe_allow_html=True)
+        st.markdown("<div class='auth-subtitle'>Step 1 of 2</div>", unsafe_allow_html=True)
+        st.caption("Shop coordinates are optional. You can use your device location or continue with the address only.")
         signup_location = location_picker(
             key="signup_shop_location_picker",
             button_label="Use My Current Location",
@@ -1442,16 +1566,21 @@ def _show_signup_page():
                     else:
                         st.session_state.signup_latitude = str(latitude)
                         st.session_state.signup_longitude = str(longitude)
-                        st.success("Current location captured. Confirm the shop address before continuing.")
+                        st.success("Current location captured. Confirm the shop address before continuing, or leave it unused.")
                 else:
                     st.warning(
                         signup_location.get("message")
-                        or "Location permission was not available. Enter the shop coordinates manually."
+                        or "Location permission was not available. You can continue using the shop address."
                     )
         with st.form("shop_details_form"):
             owner_name = st.text_input(
                 "Owner Name",
                 value=st.session_state.get("signup_owner_name", ""),
+            )
+            email = st.text_input(
+                "Email Address",
+                value=st.session_state.signup_email,
+                placeholder="Enter your email address",
             )
             shop_name = st.text_input(
                 "Shop Name",
@@ -1465,48 +1594,67 @@ def _show_signup_page():
                 "Shop Address",
                 value=st.session_state.get("signup_address", ""),
             )
-            coordinate_columns = st.columns(2)
-            latitude = coordinate_columns[0].text_input(
-                "Shop Latitude (optional)",
-                value=st.session_state.get("signup_latitude", ""),
-            )
-            longitude = coordinate_columns[1].text_input(
-                "Shop Longitude (optional)",
-                value=st.session_state.get("signup_longitude", ""),
-            )
             submitted = st.form_submit_button("CONTINUE", use_container_width=True)
         if submitted:
-            if not all([owner_name.strip(), shop_name.strip(), category.strip(), address.strip()]):
+            normalized_email = normalize_email(email)
+            if not normalized_email:
+                st.error("Please enter a valid email address.")
+            elif not all([owner_name.strip(), shop_name.strip(), category.strip(), address.strip()]):
                 st.error("Please complete all business details.")
             else:
-                latitude_missing = not latitude.strip()
-                longitude_missing = not longitude.strip()
-                coordinates_valid = True
-                if latitude_missing != longitude_missing:
-                    st.error("Enter both shop coordinates, or leave both blank.")
-                    coordinates_valid = False
-                else:
-                    if latitude_missing:
-                        latitude = longitude = None
+                session = get_session()
+                try:
+                    existing_business = session.query(Business.business_id).filter(
+                        Business.owner_email == normalized_email
+                    ).first()
+                    existing_customer = session.query(CustomerAccount.customer_id).filter(
+                        CustomerAccount.email == normalized_email
+                    ).first()
+                    if existing_business or existing_customer:
+                        st.error("An account already exists for this email address.")
                     else:
                         try:
-                            latitude, longitude = validate_coordinates(latitude, longitude)
-                        except ValueError as exc:
+                            send_email_verification_code(normalized_email, _client_ip())
+                        except EmailVerificationError as exc:
                             st.error(str(exc))
-                            coordinates_valid = False
-                if coordinates_valid:
-                    st.session_state.signup_owner_name = owner_name.strip()
-                    st.session_state.signup_shop_name = shop_name.strip()
-                    st.session_state.signup_category = category.strip()
-                    st.session_state.signup_address = address.strip()
-                    st.session_state.signup_latitude = latitude
-                    st.session_state.signup_longitude = longitude
-                    st.session_state.signup_step = "password"
-                    st.rerun()
+                        else:
+                            st.session_state.signup_email = normalized_email
+                            st.session_state.signup_owner_name = owner_name.strip()
+                            st.session_state.signup_shop_name = shop_name.strip()
+                            st.session_state.signup_category = category.strip()
+                            st.session_state.signup_address = address.strip()
+                            st.session_state.signup_pending_email = normalized_email
+                            st.session_state.signup_step = "verify_email"
+                            st.rerun()
+                finally:
+                    session.close()
+
+    elif step == "verify_email":
+        if st.session_state.get("signup_pending_email") != st.session_state.signup_email:
+            st.session_state.signup_step = "details"
+            st.rerun()
+        if st.session_state.get("signup_verified_email") == st.session_state.signup_email:
+            st.session_state.signup_step = "password"
+            st.rerun()
+        st.markdown("<div class='auth-headline'>Verify your email</div>", unsafe_allow_html=True)
+        change_email = _render_email_verification(
+            st.session_state.signup_email,
+            "shop_signup",
+            "signup_verified_email",
+        )
+        if change_email:
+            st.session_state.signup_step = "details"
+            st.session_state.pop("signup_pending_email", None)
+            st.session_state.pop("signup_verified_email", None)
+            st.rerun()
 
     elif step == "password":
+        if st.session_state.get("signup_verified_email") != st.session_state.signup_email:
+            st.session_state.signup_step = "details"
+            st.error("Verify your email before creating a business account.")
+            st.rerun()
         st.markdown("<div class='auth-headline'>Create Password</div>", unsafe_allow_html=True)
-        st.markdown("<div class='auth-subtitle'>Step 4 of 4</div>", unsafe_allow_html=True)
+        st.markdown("<div class='auth-subtitle'>Email verified · Step 2 of 2</div>", unsafe_allow_html=True)
         with st.form("shop_password_form"):
             password = st.text_input("Create Password", type="password")
             confirm_password = st.text_input("Confirm Password", type="password")
@@ -1522,29 +1670,18 @@ def _show_signup_page():
                 manager = BusinessManager()
                 session = get_session()
                 try:
-                    verification = (
-                        session.query(OtpVerification)
-                        .filter(OtpVerification.phone_number == st.session_state.signup_phone)
-                        .first()
-                    )
-                    if (
-                        verification is None
-                        or verification.verified_at is None
-                        or verification.expires_at <= datetime.utcnow()
-                    ):
-                        st.error("Please verify your phone number again before creating the account.")
-                        st.session_state.signup_step = "phone"
-                        st.rerun()
+                    account_id = generate_account_id("shopkeeper")
                     business = manager.register_business(
                         name=st.session_state.signup_shop_name,
                         category=st.session_state.signup_category,
                         address=st.session_state.signup_address,
-                        owner_phone=st.session_state.signup_phone,
-                        username=f"shop-{normalize_phone(st.session_state.signup_phone)}",
+                        owner_email=st.session_state.signup_email,
+                        business_id=account_id,
                         password_hash=hash_password(password),
                         owner_name=st.session_state.signup_owner_name,
-                        latitude=st.session_state.get("signup_latitude"),
-                        longitude=st.session_state.get("signup_longitude"),
+                        latitude=st.session_state.signup_latitude,
+                        longitude=st.session_state.signup_longitude,
+                        email_verified=True,
                     )
                     st.session_state.role = "shopkeeper"
                     st.session_state.auth_mode = "signup"
@@ -1563,21 +1700,17 @@ def _show_signup_page():
         st.markdown("<div class='auth-card' style='text-align:center;'>", unsafe_allow_html=True)
         st.markdown("<div style='font-size:2rem; color:#2E7D32; margin-bottom:0.5rem;'>✓</div>", unsafe_allow_html=True)
         st.markdown("<div class='auth-headline'>Account Created</div>", unsafe_allow_html=True)
-        business_id = st.session_state.get("signup_success_business_id") or "SB-XXXXXX"
-        st.markdown(f"<div class='auth-subtitle'>Your Business ID:</div>", unsafe_allow_html=True)
+        business_id = st.session_state.get("signup_success_business_id") or "SBZ-S-XXXXXXXXXXXX"
+        st.markdown(f"<div class='auth-subtitle'>Your Shopkeeper Account ID:</div>", unsafe_allow_html=True)
         st.markdown(f"<div style='font-size:1.8rem; font-weight:800; color:#2D2D2D; margin-bottom:0.5rem;'>{business_id}</div>", unsafe_allow_html=True)
         st.markdown("<div class='micro-copy'>Save this ID. You will use it to login.</div>", unsafe_allow_html=True)
         if st.button("GO TO LOGIN", use_container_width=True):
-            st.session_state.signup_step = "phone"
+            st.session_state.signup_step = "details"
             st.session_state.auth_mode = "login"
             st.session_state.remembered_login = {
-                "business_id": business_id,
-                "password": "",
-                "remember": False,
+                "identifier": business_id,
             }
             st.session_state.pop("signup_success_business_id", None)
-            st.session_state.pop("signup_mock_otp", None)
-            st.session_state.pop("signup_otp_expires_at", None)
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1587,22 +1720,19 @@ def _show_signup_page():
     if step != "success":
         if st.button("Back to login", use_container_width=True):
             st.session_state.auth_mode = "login"
-            st.session_state.signup_step = "phone"
-            st.session_state.pop("signup_mock_otp", None)
+            st.session_state.signup_step = "details"
             st.session_state.pop("signup_success_business_id", None)
             st.rerun()
 
 
 def _load_saved_login():
-    default = {"business_id": "", "password": "", "remember": False}
+    default = {"identifier": ""}
     saved = st.session_state.get("remembered_login", default)
     if not isinstance(saved, dict):
         return default
-    return {
-        "business_id": saved.get("business_id", ""),
-        "password": saved.get("password", ""),
-        "remember": bool(saved.get("remember", False)),
-    }
+    identifier = saved.get("identifier", saved.get("business_id", ""))
+    st.session_state.remembered_login = {"identifier": identifier}
+    return {"identifier": identifier}
 
 
 def _show_role_selection_page():
@@ -1612,69 +1742,127 @@ def _show_role_selection_page():
         unsafe_allow_html=True,
     )
 
-    col_left, col_center, col_right = st.columns([1, 2, 1])
-    with col_center:
-        st.markdown("<div class='section-heading'>Select your role</div>", unsafe_allow_html=True)
-        role_cols = st.columns(2)
-        with role_cols[0]:
-            if st.button("🏪 Shopkeeper", type="primary", use_container_width=True, key="role_shopkeeper"):
-                st.session_state.role = "shopkeeper"
-                st.session_state.auth_mode = "login"
-                st.rerun()
-        with role_cols[1]:
-            if st.button("👤 Customer", type="primary", use_container_width=True, key="role_customer"):
-                st.session_state.role = "customer"
-                st.session_state.customer_business_id = None
-                st.rerun()
+    st.markdown("<div class='section-heading'>Select your role</div>", unsafe_allow_html=True)
+    _, center_column, _ = st.columns([1, 2, 1])
+    with center_column:
+        role_columns = st.columns(3, gap="small")
+        if role_columns[0].button(
+            "🏪 Shopkeeper Login",
+            type="primary",
+            use_container_width=True,
+            key="role_shopkeeper",
+        ):
+            st.session_state.role = "shopkeeper"
+            st.session_state.auth_mode = "login"
+            st.rerun()
+        if role_columns[1].button(
+            "👤 Customer Login",
+            type="primary",
+            use_container_width=True,
+            key="role_customer_login",
+        ):
+            st.session_state.role = "customer"
+            st.session_state.auth_mode = "login"
+            st.session_state.pop("customer_guest", None)
+            st.rerun()
+        if role_columns[2].button(
+            "Browse as Guest",
+            use_container_width=True,
+            key="role_customer_guest",
+        ):
+            st.session_state.role = "customer"
+            st.session_state.customer_guest = True
+            st.session_state.customer_business_id = None
+            st.rerun()
 
 def _show_login_page():
     saved_login = _load_saved_login()
+    is_customer = st.session_state.get("role") == "customer"
+    role_title = "Customer" if is_customer else "Shopkeeper"
 
     st.markdown("<div class='auth-shell'><div class='auth-inner'>", unsafe_allow_html=True)
     st.markdown("<div class='auth-brand'><h1>WELCOME TO SMARTBIZ AI</h1><h2>Business Automation System</h2></div>", unsafe_allow_html=True)
     st.markdown("<div class='auth-card'>", unsafe_allow_html=True)
     st.markdown("<div class='auth-headline'>Welcome Back!</div>", unsafe_allow_html=True)
-    st.markdown("<div class='auth-subtitle'>Shopkeeper Login</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='auth-subtitle'>{role_title} Login</div>", unsafe_allow_html=True)
 
     with st.form("login_form"):
-        business_id = st.text_input("Business ID", value=saved_login.get("business_id", ""), key="login_business_id")
+        identifier = st.text_input(
+            "Email Address or Account ID",
+            value=saved_login.get("identifier", ""),
+            key="login_identifier",
+        )
         password = st.text_input("Password", type="password", key="login_password")
         submitted = st.form_submit_button("LOGIN", use_container_width=True)
 
     if submitted:
-        if not business_id or not password:
-            st.error("Please enter both Business ID and password.")
+        if not identifier.strip() or not password:
+            st.error("Please enter your email address or account ID and password.")
         else:
-            session = get_session()
-            try:
-                business = session.query(Business).filter(Business.business_id == business_id.strip()).first()
-                if business and business.password_hash and verify_password(password, business.password_hash):
-                    st.session_state.business_id = business.business_id
-                    st.session_state.role = "shopkeeper"
+            identifier = identifier.strip()
+            client_ip = _client_ip()
+            lockout_remaining = login_lockout_remaining(identifier, client_ip)
+            if lockout_remaining:
+                st.error(
+                    f"Too many failed login attempts. Try again in {lockout_remaining} seconds."
+                )
+            else:
+                session = get_session()
+                try:
+                    normalized_email = normalize_email(identifier)
+                    if is_customer:
+                        predicates = [CustomerAccount.customer_id == identifier]
+                        if normalized_email:
+                            predicates.append(CustomerAccount.email == normalized_email)
+                        account = session.query(CustomerAccount).filter(or_(*predicates)).first()
+                        canonical_id = account.customer_id if account else identifier
+                    else:
+                        predicates = [Business.business_id == identifier]
+                        if normalized_email:
+                            predicates.append(Business.owner_email == normalized_email)
+                        account = session.query(Business).filter(or_(*predicates)).first()
+                        canonical_id = account.business_id if account else identifier
+                finally:
+                    session.close()
+
+                lockout_remaining = login_lockout_remaining(canonical_id, client_ip)
+                if lockout_remaining:
+                    st.error(
+                        f"Too many failed login attempts. Try again in {lockout_remaining} seconds."
+                    )
+                elif (
+                    account
+                    and account.email_verified
+                    and account.password_hash
+                    and verify_password(password, account.password_hash)
+                ):
+                    clear_login_failures(canonical_id)
+                    st.session_state.role = "customer" if is_customer else "shopkeeper"
                     st.session_state.auth_mode = "login"
-                    st.session_state.remembered_login = {
-                        "business_id": business.business_id,
-                        "password": "",
-                        "remember": False,
-                    }
+                    st.session_state.remembered_login = {"identifier": identifier}
+                    if is_customer:
+                        st.session_state.customer_id = account.customer_id
+                        st.session_state.customer_name = account.name
+                        st.session_state.customer_session_id = account.customer_id
+                        st.session_state.customer_guest = False
+                    else:
+                        st.session_state.business_id = account.business_id
                     st.rerun()
                 else:
-                    st.error("Invalid Business ID or password.")
-            finally:
-                session.close()
+                    record_login_failure(canonical_id, client_ip)
+                    st.error(f"Invalid {role_title.lower()} email/account ID or password.")
 
-    st.markdown("<div class='micro-copy' style='text-align: right; margin: 0.5rem 0 1rem;'><a href='#' style='color:#6B4F3A; text-decoration:none; font-weight:600;'>Forgot Password?</a></div>", unsafe_allow_html=True)
-    st.markdown("<div class='micro-copy' style='text-align: center; margin-bottom: 0.8rem;'>New Shopkeeper?</div>", unsafe_allow_html=True)
+    st.caption("Password recovery is unavailable. Contact your administrator if you lose access.")
     if st.button("CREATE ACCOUNT", use_container_width=True):
         st.session_state.auth_mode = "signup"
         st.rerun()
 
-    st.markdown("<div style='display:flex;align-items:center;gap:0.75rem; margin: 1.25rem 0 1rem;'><div style='flex:1; height:1px; background:#E5E7EB;'></div><div style='color:#6B7280; font-weight:600;'>OR</div><div style='flex:1; height:1px; background:#E5E7EB;'></div></div>", unsafe_allow_html=True)
-    st.markdown("<div class='micro-copy' style='text-align:center; margin-bottom: 0.8rem;'>Are you a customer?</div>", unsafe_allow_html=True)
-    if st.button("VISIT A SHOP", use_container_width=True):
-        st.session_state.role = "customer"
+    if is_customer and st.button("BROWSE AS GUEST", use_container_width=True):
+        st.session_state.customer_guest = True
         st.session_state.customer_business_id = None
         st.rerun()
+    if st.button("BACK TO ROLE SELECTION", use_container_width=True):
+        _logout()
 
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div></div>", unsafe_allow_html=True)
@@ -1935,26 +2123,43 @@ def _render_knowledge_base_page():
         file = st.file_uploader(
             "Upload shop document",
             type=["pdf", "docx", "txt", "jpg", "jpeg", "png", "csv"],
-            help="Images are sent to the configured vision model to extract text before indexing.",
+            help=(
+                "Uploaded documents are processed for shop knowledge. Images are sent to the "
+                "configured vision provider for text extraction."
+            ),
+        )
+        image_processing_consent = st.checkbox(
+            "I consent to sending uploaded images to the configured vision provider for text extraction.",
+            value=False,
         )
         submitted = st.form_submit_button("Upload and index")
 
     if submitted and file is not None:
         safe_name = Path(file.name.replace("\\", "/")).name
+        is_image = Path(safe_name).suffix.lower() in {".jpg", ".jpeg", ".png"}
         if not safe_name:
             st.error("The uploaded file must have a name.")
+        elif is_image and not image_processing_consent:
+            st.warning("Consent is required before an image can be sent to the configured vision provider.")
         else:
-            with tempfile.TemporaryDirectory(prefix="smartbiz-knowledge-") as temp_dir:
-                temp_path = Path(temp_dir) / safe_name
-                temp_path.write_bytes(file.getvalue())
-                try:
-                    result = controller.add_document(business_id, str(temp_path))
-                    st.success(f"Indexed {safe_name} successfully.")
-                    st.caption(f"Documents added: {result.get('documents_added')}")
-                    st.session_state.last_doc_result = result
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Unable to index the document: {exc}")
+            try:
+                _validate_upload_size(file.size)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                with tempfile.TemporaryDirectory(prefix="smartbiz-knowledge-") as temp_dir:
+                    try:
+                        temp_path = Path(temp_dir) / safe_name
+                        temp_path.write_bytes(file.getvalue())
+                        result = controller.add_document(business_id, str(temp_path))
+                    except Exception as exc:
+                        logger.error("Knowledge document processing failed (%s).", type(exc).__name__)
+                        st.error("Unable to index the document. Check its format and try again.")
+                    else:
+                        st.success(f"Indexed {safe_name} successfully.")
+                        st.caption(f"Documents added: {result.get('documents_added')}")
+                        st.session_state.last_doc_result = result
+                        st.rerun()
 
     if not documents:
         st.info("No knowledge-base documents have been uploaded yet.")
@@ -1966,7 +2171,7 @@ def _render_knowledge_base_page():
             st.markdown(
                 f"<div style='background:#ffffff;border:1px solid #E5E7EB;border-radius:12px;padding:1rem;margin-bottom:0.8rem;'>"
                 f"<div style='display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;'>"
-                f"<div><strong>{doc.get('document_name')}</strong><br><span style='color:#6B7280;'>{doc.get('document_type') or 'unknown'} • {doc.get('status') or 'Pending'}</span></div>"
+                f"<div><strong>{_safe_html_text(doc.get('document_name'))}</strong><br><span style='color:#6B7280;'>{_safe_html_text(doc.get('document_type') or 'unknown')} • {_safe_html_text(doc.get('status') or 'Pending')}</span></div>"
                 f"<div style='color:#6B7280;'>Chunks: {doc.get('chunk_count') or 0}</div>"
                 f"</div>"
                 f"</div>",
@@ -1999,9 +2204,8 @@ def _render_profile_page():
         profile_columns[0].text_input("Category", value=business.category or "", disabled=True)
         st.subheader("Shop location for nearby discovery")
         st.caption(
-            "While on-site, use your device location or enter the shop's exact coordinates and address. "
-            "Existing geocoded locations are based on the saved town/city address and may be approximate. "
-            "Save the shop's exact location here to replace an approximate pin."
+            "Enter and save the shop address below. Coordinates are optional; while on-site, "
+            "you can use your device location without entering latitude or longitude."
         )
         shop_location_result = location_picker(
             key=f"shop_location_picker_{business_id}",
@@ -2020,22 +2224,32 @@ def _render_profile_page():
                             shop_location_result.get("latitude"),
                             shop_location_result.get("longitude"),
                         )
-                        save_shop_coordinates(
-                            business_id,
-                            shop_latitude,
-                            shop_longitude,
-                        )
+                        address = business.address
+                        if not address:
+                            st.error("Enter and save the shop address before saving its location.")
+                            continue_saving = False
+                        else:
+                            save_shop_location(
+                                business_id,
+                                address,
+                                shop_latitude,
+                                shop_longitude,
+                            )
+                            continue_saving = True
                     except ValueError as exc:
                         st.error(str(exc))
-                    except Exception:
-                        logger.exception(
-                            "Unable to save shop coordinates for business %s",
-                            business_id,
+                        continue_saving = False
+                    except Exception as exc:
+                        logger.error(
+                            "Unable to save shop coordinates (%s).",
+                            type(exc).__name__,
                         )
                         st.error("Unable to save the shop location. Please try again.")
+                        continue_saving = False
                     else:
-                        st.success("Shop location saved from this device.")
-                        st.rerun()
+                        if continue_saving:
+                            st.success("Shop address and location saved.")
+                            st.rerun()
                 else:
                     st.warning(
                         shop_location_result.get("message")
@@ -2046,28 +2260,20 @@ def _render_profile_page():
                 "Shop Address",
                 value=business.address or "",
             )
-            coordinate_columns = st.columns(2)
-            latitude = coordinate_columns[0].text_input(
-                "Latitude",
-                value="" if business.latitude is None else str(business.latitude),
-                placeholder="e.g. 13.6288",
-            )
-            longitude = coordinate_columns[1].text_input(
-                "Longitude",
-                value="" if business.longitude is None else str(business.longitude),
-                placeholder="e.g. 79.4192",
-            )
-            save_location = st.form_submit_button("Save address and location")
+            save_location = st.form_submit_button("Save shop address")
         if save_location:
             try:
-                save_shop_location(business_id, address, latitude, longitude)
+                save_shop_address(business_id, address)
             except ValueError as exc:
                 st.error(str(exc))
-            except Exception:
-                logger.exception("Unable to save shop coordinates for business %s", business_id)
+            except Exception as exc:
+                logger.error(
+                    "Unable to save shop coordinates (%s).",
+                    type(exc).__name__,
+                )
                 st.error("Unable to save the shop location. Please try again.")
             else:
-                st.success("Shop address and location saved.")
+                st.success("Shop address saved.")
                 st.rerun()
 
         st.subheader("Account")
@@ -2117,7 +2323,7 @@ def _render_analytics_page():
         st.warning("Please log in to view analytics.")
         return
 
-    today = datetime.utcnow().date()
+    today = utc_now_for_database().date()
     selected_period = st.selectbox("Reporting period", ["All time", "Today", "Last 7 Days", "This Month"])
     date_from = None
     date_to = None
@@ -2447,8 +2653,12 @@ def _render_shop_ai_chat():
             )
         if not response or response.startswith("Sorry, something went wrong"):
             raise RuntimeError("The configured LLM could not generate a response.")
-    except Exception:
-        logger.exception("Shopkeeper AI chat failed for business %s", business_id)
+    except Exception as exc:
+        logger.error(
+            "Shopkeeper AI chat failed for business %s (%s).",
+            business_id,
+            type(exc).__name__,
+        )
         history.pop()
         st.error("I couldn't get an AI response. Check the AI provider settings and try again.")
         return
@@ -2462,7 +2672,10 @@ def _render_shop_ai_chat():
 
 def _render_ai_business_hub_page():
     st.title("AI Business Hub")
-    st.caption("Shop knowledge and AI tools for your business.")
+    st.caption(
+        "Shop chat prompts and retrieved shop knowledge are sent to the AI provider configured by the operator. "
+        "Uploaded image content is sent to the configured vision provider for text extraction."
+    )
     knowledge_tab, insights_tab, chat_tab = st.tabs(
         ["Shop Knowledge", "AI Insights", "AI Chat"]
     )
@@ -2551,7 +2764,10 @@ def _render_nearby_shop_discovery():
     )
     st.caption("Location data © OpenStreetMap contributors.")
 
-    location_result = location_picker(key="customer_nearby_location_picker")
+    current_location = st.session_state.get("customer_nearby_location") or {}
+    location_result = location_picker(
+        key="customer_nearby_location_picker",
+    )
     if isinstance(location_result, dict):
         request_id = location_result.get("request_id")
         if request_id and request_id != st.session_state.get("customer_nearby_request_id"):
@@ -2628,10 +2844,12 @@ def _render_nearby_shop_discovery():
         location["latitude"] is not None and location["longitude"] is not None
     )
     if has_search_coordinates:
-        st.markdown(f"**Nearby registered shops · {label} · within 50 km**")
+        radius_km = 5
+        st.markdown(f"**Nearby registered shops · {label} · within 5 km**")
         results = search_nearby_shops(
             location["latitude"],
             location["longitude"],
+            radius_km=radius_km,
         )
     else:
         st.markdown(f"**Registered shops matching {label}**")
@@ -2696,14 +2914,12 @@ def _render_nearby_shop_discovery():
                         st.rerun()
 
     if nearby_shops:
-        st.subheader(
-            "Shops matching this town"
-            if not has_search_coordinates
-            else "Shops within 50 km"
-        )
+        st.subheader("Shops within 5 km" if has_search_coordinates else "Shops matching this town")
         render_shop_cards(nearby_shops)
     if outside_shops:
-        with st.expander(f"Outside the 50 km radius ({len(outside_shops)})"):
+        with st.expander(
+            f"Outside the 5 km radius ({len(outside_shops)})"
+        ):
             st.caption("These registered shops match the town, but are outside the nearby radius.")
             render_shop_cards(outside_shops)
     if missing_shops:
@@ -2810,11 +3026,68 @@ def _render_customer_shop_page(customer_session_id, business):
         st.info("Your cart is empty.")
     else:
         st.dataframe(cart, use_container_width=True, hide_index=True)
+        customer_id = st.session_state.get("customer_id")
+        saved_location = get_customer_saved_location(customer_id) if customer_id else None
+        if saved_location:
+            st.session_state.setdefault(
+                "customer_address", saved_location.get("address") or ""
+            )
+            st.session_state.setdefault(
+                "customer_latitude", saved_location.get("latitude")
+            )
+            st.session_state.setdefault(
+                "customer_longitude", saved_location.get("longitude")
+            )
+        location_result = location_picker(
+            key=f"customer_checkout_location_{customer_session_id}",
+            button_label="Use My Location",
+        )
+        if (
+            isinstance(location_result, dict)
+            and location_result.get("request_id")
+            != st.session_state.get("customer_checkout_location_request_id")
+        ):
+            st.session_state.customer_checkout_location_request_id = location_result.get(
+                "request_id"
+            )
+            if location_result.get("status") == "success":
+                address = str(
+                    st.session_state.get("customer_address")
+                    or (saved_location or {}).get("address")
+                    or ""
+                ).strip()
+                try:
+                    latitude, longitude = validate_optional_coordinates(
+                        location_result.get("latitude"),
+                        location_result.get("longitude"),
+                    )
+                    st.session_state.customer_address = address
+                    st.session_state.customer_latitude = latitude
+                    st.session_state.customer_longitude = longitude
+                    if customer_id and address:
+                        save_customer_location(
+                            customer_id, address, latitude, longitude
+                        )
+                    st.rerun()
+                except ValueError as exc:
+                    st.warning(str(exc))
+                except Exception as exc:
+                    logger.error(
+                        "Unable to save customer location (%s).",
+                        type(exc).__name__,
+                    )
+                    st.error("Unable to save the delivery location. Please try again.")
+            elif location_result.get("status") == "error":
+                st.warning(
+                    location_result.get("message")
+                    or "Unable to get your location. You can enter an address manually."
+                )
         with st.form(f"customer_checkout_{business_id}"):
             customer_name = st.text_input("Your name", value=st.session_state.get("customer_name", ""))
             customer_phone = st.text_input("Phone number", value=st.session_state.get("customer_phone", ""))
             customer_address = st.text_area("Delivery address", value=st.session_state.get("customer_address", ""))
             payment_method = st.selectbox("Payment method", ["COD", "EMI"])
+            st.caption("COD and EMI are recorded as order details only; no payment is processed.")
             confirm_order = st.checkbox("I confirm these order details.")
             submit_order = st.form_submit_button("Place Order", type="primary")
         if submit_order:
@@ -2883,6 +3156,62 @@ def _render_customer_settings(customer_session_id, business):
     st.code(customer_session_id[:8] + "..." if len(customer_session_id) > 12 else customer_session_id)
     st.write(f"Current shop: {business['name'] if business else 'None selected'}")
     st.subheader("Contact details")
+    customer_id = st.session_state.get("customer_id")
+    saved_location = get_customer_saved_location(customer_id) if customer_id else None
+    if saved_location:
+        st.session_state.setdefault(
+            "customer_address", saved_location.get("address") or ""
+        )
+        st.session_state.setdefault(
+            "customer_latitude", saved_location.get("latitude")
+        )
+        st.session_state.setdefault(
+            "customer_longitude", saved_location.get("longitude")
+        )
+    location_result = location_picker(
+        key=f"customer_profile_location_{customer_session_id}",
+        button_label="Use My Location",
+    )
+    if (
+        isinstance(location_result, dict)
+        and location_result.get("request_id")
+        != st.session_state.get("customer_profile_location_request_id")
+    ):
+        st.session_state.customer_profile_location_request_id = location_result.get(
+            "request_id"
+        )
+        if location_result.get("status") == "success":
+            address = str(
+                st.session_state.get("customer_address")
+                or (saved_location or {}).get("address")
+                or ""
+            ).strip()
+            try:
+                latitude, longitude = validate_optional_coordinates(
+                    location_result.get("latitude"),
+                    location_result.get("longitude"),
+                )
+                st.session_state.customer_address = address
+                st.session_state.customer_latitude = latitude
+                st.session_state.customer_longitude = longitude
+                st.session_state.customer_profile_address_input = address
+                if customer_id and address:
+                    save_customer_location(customer_id, address, latitude, longitude)
+                st.success("Address and map location saved.")
+                st.rerun()
+            except ValueError as exc:
+                st.warning(str(exc))
+            except Exception as exc:
+                logger.error(
+                    "Unable to save customer location (%s).",
+                    type(exc).__name__,
+                )
+                st.error("Unable to save the delivery location. Please try again.")
+        elif location_result.get("status") == "error":
+            st.warning(
+                location_result.get("message")
+                or "Unable to get your location. Enter an address manually."
+            )
     with st.form("customer_contact_details_form"):
         customer_name = st.text_input(
             "Your name",
@@ -2908,7 +3237,26 @@ def _render_customer_settings(customer_session_id, business):
             st.session_state.customer_name = customer_name.strip()
             st.session_state.customer_phone = customer_phone.strip()
             st.session_state.customer_address = customer_address.strip()
-            st.success("Contact details saved for this customer session.")
+            if customer_id and customer_address.strip():
+                try:
+                    save_customer_location(
+                        customer_id,
+                        customer_address,
+                        st.session_state.get("customer_latitude"),
+                        st.session_state.get("customer_longitude"),
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    logger.error(
+                        "Unable to save customer address (%s).",
+                        type(exc).__name__,
+                    )
+                    st.error("Unable to save the delivery address. Please try again.")
+                else:
+                    st.success("Contact details and address saved.")
+            else:
+                st.success("Contact details saved for this customer session.")
     if business and st.button("Leave Current Shop"):
         st.session_state.customer_business_id = None
         st.session_state.customer_shop_detail = False
@@ -2938,6 +3286,10 @@ def _render_customer_marketplace_assistant(customer_session_id):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
+    st.caption(
+        "Messages and relevant shop information are sent to the AI provider configured by the operator. "
+        "Avoid sharing sensitive personal information."
+    )
     question = st.chat_input("Ask anything, or compare a product across shops...")
     if not question:
         return
@@ -2949,8 +3301,11 @@ def _render_customer_marketplace_assistant(customer_session_id):
             with st.spinner("Checking shop listings and preparing an answer..."):
                 answer = AIAgent().chat_marketplace(question, history)
             st.markdown(answer)
-    except Exception:
-        logger.exception("Marketplace assistant failed for customer session %s", customer_session_id)
+    except Exception as exc:
+        logger.error(
+            "Marketplace assistant failed (%s).",
+            type(exc).__name__,
+        )
         answer = (
             "I couldn't prepare an answer right now. You can still use the dashboard search "
             "to check live shop and product listings."
@@ -3095,6 +3450,13 @@ def _render_customer_interface():
 
     st.sidebar.markdown("## SMARTBIZ AI")
     st.sidebar.caption("Business Automation System")
+    if st.session_state.get("customer_id"):
+        st.sidebar.caption(
+            f"{st.session_state.get('customer_name', 'Customer')} "
+            f"· {st.session_state.customer_id}"
+        )
+    else:
+        st.sidebar.caption("Guest customer")
     page = st.sidebar.radio("Customer navigation", customer_pages, key="customer_page")
     if business:
         st.sidebar.divider()
@@ -3105,6 +3467,8 @@ def _render_customer_interface():
             st.session_state.customer_shop_detail = False
             st.session_state.requested_customer_page = "Dashboard"
             st.rerun()
+    if st.sidebar.button("LOG OUT", key="customer_logout"):
+        _logout()
 
     if page == "Dashboard":
         if business and st.session_state.get("customer_shop_detail"):
@@ -3412,9 +3776,9 @@ def _render_escalated_chats_page():
     for option in options:
         st.markdown(
             "<div style='background:#FFFFFF;border:1px solid #E5E7EB;border-radius:12px;padding:1rem;margin-bottom:0.8rem;'>"
-            f"<div style='display:flex;justify-content:space-between;align-items:center;gap:1rem;'><div><strong>📱 {option['customer_phone']}</strong></div><div style='background:#FDECEC;color:#B42318;border-radius:999px;padding:0.25rem 0.6rem;font-size:0.72rem;font-weight:700;'>{option['status']}</div></div>"
-            f"<div style='color:#6B7280;margin-top:0.6rem;'>{option['latest_message']}</div>"
-            f"<div style='color:#6B7280;font-size:0.8rem;margin-top:0.5rem;'>Updated: {option['updated_at']}</div>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center;gap:1rem;'><div><strong>📱 {_safe_html_text(option['customer_phone'])}</strong></div><div style='background:#FDECEC;color:#B42318;border-radius:999px;padding:0.25rem 0.6rem;font-size:0.72rem;font-weight:700;'>{_safe_html_text(option['status'])}</div></div>"
+            f"<div style='color:#6B7280;margin-top:0.6rem;'>{html.escape(str(option['latest_message']))}</div>"
+            f"<div style='color:#6B7280;font-size:0.8rem;margin-top:0.5rem;'>Updated: {html.escape(str(option['updated_at']))}</div>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -3423,8 +3787,8 @@ def _render_escalated_chats_page():
             st.rerun()
 
     st.markdown("<hr style='border-top:1px solid #E5E7EB; margin:1.5rem 0;'>", unsafe_allow_html=True)
-    st.markdown(f"<div style='font-size:1.3rem;font-weight:700;margin-bottom:0.5rem;'>Conversation with {selected['customer_phone']}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div style='color:#6B7280;'>Status: <span style='color:#B42318;font-weight:700;'>{selected['status']}</span> • Last updated: {selected['updated_at']}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='font-size:1.3rem;font-weight:700;margin-bottom:0.5rem;'>Conversation with {_safe_html_text(selected['customer_phone'])}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='color:#6B7280;'>Status: <span style='color:#B42318;font-weight:700;'>{_safe_html_text(selected['status'])}</span> • Last updated: {_safe_html_text(selected['updated_at'])}</div>", unsafe_allow_html=True)
 
     session = get_session()
     try:
@@ -3460,7 +3824,11 @@ def _render_escalated_chats_page():
             sender_name = "AI"
             bubble_class = "chat-bubble-ai"
 
-        st.markdown(f"<div class='{bubble_class}'><strong>{sender_name}:</strong> {message.text}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='{bubble_class}'><strong>{sender_name}:</strong> "
+            f"{html.escape(str(message.text))}</div>",
+            unsafe_allow_html=True,
+        )
 
     with st.form("keeper_reply_form"):
         reply = st.text_area("Reply to customer", key=f"keeper_reply_{selected['conversation'].id}", placeholder="Type your response...")
@@ -3484,13 +3852,28 @@ def _render_escalated_chats_page():
 def main():
     st.set_page_config(page_title="SMART BIZ AI", page_icon="🏪", layout="wide")
     _apply_dashboard_theme()
+    missing_configuration = settings.missing_required_configuration()
+    if missing_configuration:
+        st.warning(
+            "Some features are unavailable until deployment settings are configured: "
+            + ", ".join(missing_configuration)
+        )
 
     if "role" not in st.session_state:
         _show_role_selection_page()
         return
 
     if st.session_state.role == "customer":
-        _render_customer_interface()
+        if (
+            st.session_state.get("customer_id")
+            or st.session_state.get("customer_guest")
+        ):
+            _render_customer_interface()
+        else:
+            if st.session_state.get("auth_mode") == "signup":
+                _show_signup_page()
+            else:
+                _show_login_page()
         return
 
     if "auth_mode" not in st.session_state:

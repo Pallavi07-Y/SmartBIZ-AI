@@ -1,5 +1,7 @@
 from datetime import datetime
 
+from app.utils.time import utc_now_for_database
+
 from app.business.analytics import get_business_metrics
 from app.business.register_business import BusinessManager
 from app.database import Conversation, ConversationStatus, Order, Product, get_session
@@ -9,7 +11,7 @@ def test_business_metrics_are_scoped_and_calculated_from_live_records(isolated_d
     manager = BusinessManager()
     shop_a = manager.register_business("Shop A", "Electronics", username="analytics-shop-a")
     shop_b = manager.register_business("Shop B", "Electronics", username="analytics-shop-b")
-    today = datetime.utcnow().date()
+    today = utc_now_for_database().date()
 
     session = get_session()
     try:
@@ -109,7 +111,7 @@ def test_business_metrics_return_empty_values_without_business_id():
 
 def test_business_metrics_support_date_range_filter(isolated_database):
     shop = BusinessManager().register_business("Date Shop", "Retail", username="analytics-date-shop")
-    today = datetime.utcnow().date()
+    today = utc_now_for_database().date()
     session = get_session()
     try:
         session.add_all([

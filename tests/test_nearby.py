@@ -6,10 +6,13 @@ from app.business.nearby import (
     save_shop_coordinates,
     save_shop_location,
     search_nearby_shops,
+    get_customer_saved_location,
+    save_customer_location,
     validate_coordinates,
 )
 from app.business.register_business import BusinessManager
-from app.database import Business, Product, get_session
+from app.database import Business, CustomerAccount, Product, get_session
+from app.utils.auth import register_customer_account
 
 
 def test_nearby_search_sorts_real_shops_and_includes_active_products(isolated_database):
@@ -71,6 +74,104 @@ def test_nearby_search_sorts_real_shops_and_includes_active_products(isolated_da
     }]
     assert result["missing_coordinates"] == 1
     assert result["missing_coordinate_shops"][0]["business_id"] == unlocated["business_id"]
+
+
+@pytest.mark.parametrize("radius_km", [2, 5, 10, 25])
+def test_nearby_search_respects_supported_radius_and_distance_order(
+    isolated_database,
+    radius_km,
+):
+    manager = BusinessManager()
+    origin = manager.register_business(
+        "Origin Shop",
+        "Retail",
+        business_id=f"origin-{radius_km}",
+        latitude=0,
+        longitude=0,
+    )
+    within = manager.register_business(
+        "Within Shop",
+        "Retail",
+        business_id=f"within-{radius_km}",
+        latitude=0,
+        longitude=radius_km * 0.7 / 111.0,
+    )
+    outside = manager.register_business(
+        "Outside Shop",
+        "Retail",
+        business_id=f"outside-{radius_km}",
+        latitude=0,
+        longitude=(radius_km + 2) / 111.0,
+    )
+
+    results = search_nearby_shops(0, 0, radius_km=radius_km)
+
+    assert [shop["business_id"] for shop in results["nearby_shops"]] == [
+        origin["business_id"],
+        within["business_id"],
+    ]
+    assert results["nearby_shops"][0]["distance_km"] <= results["nearby_shops"][1]["distance_km"]
+    assert [shop["business_id"] for shop in results["outside_radius_shops"]] == [
+        outside["business_id"]
+    ]
+
+
+def test_customer_saved_address_and_coordinates_persist_in_sqlite(isolated_database):
+    account = register_customer_account(
+        "Map Customer",
+        "map-customer@example.com",
+        "secure-pass",
+    )
+
+    save_customer_location(
+        account["customer_id"],
+        "12 Main Street, Sample Town",
+        "13.6288",
+        "79.4192",
+    )
+
+    assert get_customer_saved_location(account["customer_id"]) == {
+        "address": "12 Main Street, Sample Town",
+        "latitude": pytest.approx(13.6288),
+        "longitude": pytest.approx(79.4192),
+    }
+    session = get_session()
+    try:
+        stored = session.get(CustomerAccount, account["customer_id"])
+        assert stored.delivery_address == "12 Main Street, Sample Town"
+        assert stored.latitude == pytest.approx(13.6288)
+        assert stored.longitude == pytest.approx(79.4192)
+    finally:
+        session.close()
+
+
+def test_customer_location_validation_rejects_partial_or_invalid_coordinates(isolated_database):
+    account = register_customer_account(
+        "Validation Customer",
+        "validation-customer@example.com",
+        "secure-pass",
+    )
+
+    with pytest.raises(ValueError, match="both coordinates"):
+        save_customer_location(
+            account["customer_id"],
+            "Sample address",
+            13.6,
+            None,
+        )
+    with pytest.raises(ValueError, match="outside the valid range"):
+        save_customer_location(
+            account["customer_id"],
+            "Sample address",
+            100,
+            0,
+        )
+    save_customer_location(account["customer_id"], " ", None, None)
+    assert get_customer_saved_location(account["customer_id"]) == {
+        "address": None,
+        "latitude": None,
+        "longitude": None,
+    }
 
 
 def test_outside_radius_shops_are_separate_from_missing_coordinates(isolated_database):

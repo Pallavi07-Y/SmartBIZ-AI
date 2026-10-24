@@ -1,5 +1,8 @@
 # Secrets
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
 
 # Python
 __pycache__/
@@ -8,9 +11,15 @@ __pycache__/
 # Virtual environment
 venv/
 .venv/
+env/
 
 # Database
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
 
 # ChromaDB
 data/chroma_db/
@@ -19,6 +28,9 @@ data/chroma_db/
 temp_*.py
 tmp_debug.sqlite3
 tmpseedcheck/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # VS Code
 .vscode/

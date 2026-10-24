@@ -1,5 +1,6 @@
 from collections import defaultdict
 from datetime import date, datetime
+from app.utils.time import utc_now_for_database
 
 from app.database import Conversation, ConversationStatus, Order, Product, get_session
 
@@ -64,7 +65,7 @@ def get_business_metrics(business_id, *, today=None, date_from=None, date_to=Non
             "low_stock_items": [],
         }
 
-    today = today or datetime.utcnow().date()
+    today = today or utc_now_for_database().date()
     if isinstance(today, datetime):
         today = today.date()
     session = get_session()

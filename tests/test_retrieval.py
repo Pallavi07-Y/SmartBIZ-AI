@@ -6,6 +6,28 @@ from app.rag.rag_pipeline import RAGPipeline
 from app.rag.retriever import Retriever
 
 
+def test_embedding_model_uses_cached_files_without_network(monkeypatch):
+    from app.rag import embedding
+
+    calls = {}
+
+    class FakeSentenceTransformer:
+        def __init__(self, model_name, **kwargs):
+            calls["model_name"] = model_name
+            calls.update(kwargs)
+
+        def get_embedding_dimension(self):
+            return 384
+
+    monkeypatch.setattr(embedding, "SentenceTransformer", FakeSentenceTransformer)
+
+    model = embedding.EmbeddingModel()
+
+    assert model.dimension == 384
+    assert calls["model_name"] == settings.EMBEDDING_MODEL
+    assert calls["local_files_only"] is True
+
+
 def test_retrieval_filter_uses_semantic_distance_not_query_word_matching():
     pipeline = RAGPipeline.__new__(RAGPipeline)
     query = "Could I get my money back if I kept the purchase in its original condition?"

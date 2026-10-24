@@ -75,31 +75,37 @@ The command idempotently seeds ABC Mobiles and nine additional sample shops, add
 - ChromaDB, LangChain, and Sentence Transformers
 - Existing configured OpenAI-compatible LLM client
 
-For JPG/PNG knowledge uploads, `VISION_MODEL` selects an image-capable model supported by the configured `BASE_URL`. The default is `meta-llama/llama-4-scout-17b-16e-instruct`. Uploaded images are sent to that provider for text extraction before being indexed in the business-specific ChromaDB collection.
+For JPG/PNG knowledge uploads, `VISION_MODEL` selects an image-capable model supported by the configured `BASE_URL`. The default is `meta-llama/llama-4-scout-17b-16e-instruct`. Image contents are sent to that provider for text extraction before indexing; the uploader requires an explicit consent checkbox. Chat prompts and retrieved shop knowledge are also sent to the configured AI provider. Do not include sensitive personal or financial information unless the provider and data handling have been approved for that use. Original uploaded files are processed from temporary storage and are not retained; re-upload them if the ChromaDB index is lost.
 
-Nearby discovery uses OpenStreetMap Nominatim to resolve a town from live coordinates or a manually entered place. The customer is informed before choosing either search method. GPS access is only requested after selecting **Use My Location**. Existing shop addresses are geocoded to approximate town/city coordinates; shopkeepers can replace those pins with exact shop coordinates. Town search shows shops without active products and separates shops outside the 50 km radius from shops missing coordinates.
+There is no Google Maps integration or Maps API key requirement. Customers and shopkeepers can enter an address and may optionally use browser geolocation; latitude and longitude are never required as manual input. Customer delivery addresses and available coordinates, and shopkeeper addresses and available coordinates, are stored in SQLite. Customer nearby discovery uses a fixed 5 km radius when device coordinates are available; address-only searches use the existing OpenStreetMap Nominatim town lookup and cannot calculate an exact distance.
 
 ## Run
 
-Run these commands from the project root in PowerShell. They reuse the checked-in local `.venv`; do not create another environment or install packages for the demo.
+Python 3.13.2 is the version exercised in the development workspace; the repository does not declare a broader supported Python range. For a fresh clone, run these commands from the project root in PowerShell:
 
 ```powershell
-.\.venv\Scripts\python.exe --version
+py -3.13 --version
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Set the LLM provider's `API_KEY` in the ignored local `.env` file if it is not already configured. Keep the key private; do not paste it into chat, screenshots, or source control. `BASE_URL` and `MODEL` can use the existing values in that file.
+Customer and shopkeeper signups require a six-digit email verification code sent through Gmail SMTP before an account is created. Codes expire after 10 minutes by default, are stored only as keyed hashes, are single-use, and have attempt, resend-cooldown, and hourly email/IP request limits. Existing accounts are marked verified by the additive schema migration so current users retain access. Shopkeepers and customers receive permanent IDs (`SBZ-S-...` and `SBZ-U-...`) and can sign in using either that ID or their registered email.
+
+Set `API_KEY` in a private environment, ignored local `.env`, or Streamlit secrets for AI features. Configure optional `BASE_URL`, `MODEL`, and `VISION_MODEL` for the compatible AI provider. Never put secrets in source control, logs, screenshots, or chat. Login and upload limits can be tuned with the `LOGIN_*` and `MAX_UPLOAD_SIZE_MB` environment variables; all limits must be positive integers.
+
+Email verification requires `SMTP_USERNAME`, `SMTP_PASSWORD`, and `EMAIL_OTP_HASH_SECRET`. Use a Gmail App Password (with Google 2-Step Verification enabled), not your normal Gmail password. Generate a separate random `EMAIL_OTP_HASH_SECRET` of at least 32 characters and keep it private; changing it invalidates pending codes. Optional settings include `SMTP_HOST` (defaults to `smtp.gmail.com`), `SMTP_PORT` (defaults to `465`), `SMTP_FROM_EMAIL` (defaults to `SMTP_USERNAME`), and the `EMAIL_OTP_*` limits and expiry settings.
 
 ```powershell
 notepad .env
 ```
 
-Start the existing Streamlit dashboard:
+Create `.env` locally without committing it. Start the dashboard:
 
 ```powershell
 .\.venv\Scripts\python.exe -m streamlit run app\dashboard.py
 ```
 
-Open the local URL Streamlit prints (normally `http://localhost:8501`). Use the shopkeeper login or customer shop browsing from the home page. The app uses the existing `data\business.sqlite3` and `data\chroma_db`; do not run the demo seeder for this presentation because it writes to those stores.
+Open the local URL Streamlit prints (normally `http://localhost:8501`). Check `http://localhost:8501/_stcore/health` for a successful health response. The app uses local SQLite and ChromaDB stores; do not run the demo seeder against a database containing user data.
 
 Run the complete local regression suite:
 
@@ -107,25 +113,56 @@ Run the complete local regression suite:
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-## Deployment notes
+## Streamlit Community Cloud deployment
 
-The application can be started with the command above, but this repository does not include a container image, deployment manifest, or CI/CD configuration. For a hosted Streamlit service, bind to the interface and port provided by the host, for example:
+The app entrypoint is `app/dashboard.py`. From the repository root, the local startup command is:
 
-```sh
-python -m streamlit run app/dashboard.py --server.address 0.0.0.0 --server.port "${PORT:-8501}"
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app\dashboard.py
 ```
 
-Configure `API_KEY` through the host's secret store. `BASE_URL` and `MODEL` can select the compatible LLM endpoint and model; `VISION_MODEL` is optional. Do not commit `.env` or put secret values in deployment files.
+To deploy a demo on Streamlit Community Cloud:
 
-The default SQLite database and the ChromaDB index are local files. Configure `DATABASE_URL`, `DOCUMENT_PATH`, and `CHROMA_DB_PATH` to locations on durable storage before deployment. For example, with a persistent volume mounted at `/mnt/smartbiz-data`, use a SQLite URL such as `sqlite:////mnt/smartbiz-data/business.sqlite3`, `DOCUMENT_PATH=/mnt/smartbiz-data/documents`, and `CHROMA_DB_PATH=/mnt/smartbiz-data/chroma_db`. Back up the database and uploaded documents as well as the vector index. Keep this deployment to one app instance: SQLite and the local ChromaDB persistence directory are not a shared, multi-replica data service. For concurrent or horizontally scaled production use, migrate these stores to suitable managed services and test the migration.
+1. Revoke any API key that has ever been committed, pasted into chat, or otherwise exposed; create a replacement with the provider and store it only in Streamlit Community Cloud's app **Settings → Secrets**.
+2. Push the intended branch to GitHub only after reviewing its complete diff and confirming `.env`, local databases, and ChromaDB files are ignored and untracked.
+3. In Streamlit Community Cloud, choose **Create app**, select the repository and branch, and set the main file path to `app/dashboard.py`.
+4. In **Advanced settings**, select Python 3.13 (the version tested for this project), then create the secrets below in the app's Secrets editor. Use your own secret values there; do not commit a `secrets.toml` file.
+5. Deploy and verify the app opens, account signup sends an email, customer and shopkeeper login work, and AI/RAG features can load their configured models.
+
+The following TOML shows the required key names and expected shape only; replace placeholders in the Cloud Secrets editor. `BASE_URL`, `MODEL`, and `VISION_MODEL` are optional if the defaults are suitable.
+
+```toml
+API_KEY = "<replacement Groq API key>"
+EMAIL_OTP_HASH_SECRET = "<random private string at least 32 characters long>"
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = "465"
+SMTP_USERNAME = "<Gmail address>"
+SMTP_PASSWORD = "<Gmail App Password>"
+SMTP_FROM_EMAIL = "<Gmail address>"
+
+# Optional AI provider settings:
+BASE_URL = "https://api.groq.com/openai/v1"
+MODEL = "<model supported by the configured provider>"
+VISION_MODEL = "<vision model supported by the configured provider>"
+```
+
+For Gmail, enable 2-Step Verification and create an App Password for this application. Put that App Password in `SMTP_PASSWORD`; never use your regular Google account password. SMTP credentials and the independent OTP hash secret must remain in Cloud Secrets or a private local environment. If the OTP hash secret is rotated, outstanding verification codes stop working.
+
+`requirements.txt` is at the repository root and is used by Community Cloud. No custom startup script or `PORT` variable is needed; the platform launches the selected Streamlit entrypoint. The app reads API and mail credentials from environment variables first and Streamlit secrets second.
+
+### Persistence and feature limitations on Community Cloud
+
+The current application stores account data and OTP challenges in local SQLite and embeddings in a local ChromaDB directory under `data/`. Community Cloud does not provide this app with a durable volume contract. Treat SQLite, OTP challenges, and ChromaDB on the instance as **ephemeral**: rebuilds, restarts, or instance replacement may discard them. Do not use this setup for durable customer or business records. Before production use, move these stores to managed durable services and verify backups and restore procedures. No data migration or external storage has been configured by this project.
+
+The embedding model is loaded with `local_files_only=True`. AI/RAG functions that need embeddings will fail unless `all-MiniLM-L6-v2` is already available in the deployment's model cache; the repository does not currently provision that model as part of the Community Cloud build. Verify model availability in the target environment before relying on document indexing or semantic search.
+
+Schema startup migrations are additive and recorded in `schema_migrations`. Version 5 adds email verification state and OTP challenge storage; legacy accounts are marked verified to preserve existing access. For local upgrades, take a verified backup first. There is no automatic destructive down-migration; roll back by restoring the pre-upgrade SQLite backup and matching ChromaDB backup, if used.
 
 ### Production blockers
 
-- Shopkeeper signup currently uses a development OTP: the code is shown in the UI and no SMS provider is connected. Do not treat this as phone verification for a public deployment.
-- Shopkeeper password login has no account lockout or login rate limit.
-- The “Forgot Password?” link is only a placeholder; there is no password recovery flow.
+- Password recovery is unavailable. Implement and test a secure email-based reset flow before opening public signup, or provide a documented and staffed recovery process.
+- COD and EMI are stored as order metadata only; the application does not process payments.
 - Customer access is browser-session based rather than account authenticated. Customers can lose access to their conversation/order history when that browser session is lost.
-- The displayed COD/EMI choices are order metadata; no payment gateway integration is configured.
 - Shop coordinates in the current database are town-level approximate pins (`location_precision="town"`), not verified storefront locations.
 
-Address these limitations, configure durable storage and secret management, and exercise the production deployment before making the service publicly available.
+Community Cloud's local storage and the uncached embedding-model requirement are additional deployment limitations. Before a public or production launch, configure durable storage and model provisioning, implement password recovery, verify AI provider behavior in the deployment environment, and review external AI data handling and consent with users.

@@ -19,7 +19,9 @@ def test_business_registration_and_search_use_isolated_database(isolated_databas
 
     assert found_by_id["name"] == "Test Shop"
     assert found_by_id["address"] == "1 Main Street"
-    assert found_by_id["owner_phone"] == "9876543210"
+    assert "owner_phone" not in found_by_id
+    assert "username" not in found_by_id
+    assert "password_hash" not in found_by_id
     assert found_by_name[0]["business_id"] == created["business_id"]
 
 

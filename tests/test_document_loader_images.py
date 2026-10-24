@@ -82,3 +82,18 @@ def test_image_document_loader_rejects_non_jpeg_and_png_files(tmp_path):
 
     with pytest.raises(ValueError, match="Only JPG and PNG"):
         DocumentLoader().load_document(source)
+
+
+def test_document_loader_rejects_oversized_file_before_parsing(tmp_path, monkeypatch):
+    source = tmp_path / "oversized.pdf"
+    with source.open("wb") as file:
+        file.truncate(1024 * 1024 + 1)
+    monkeypatch.setattr(document_loader_module.settings, "MAX_UPLOAD_SIZE_MB", 1)
+    monkeypatch.setattr(
+        document_loader_module,
+        "PyPDFLoader",
+        lambda *_: pytest.fail("Oversized content reached the PDF parser."),
+    )
+
+    with pytest.raises(ValueError, match="1 MB"):
+        DocumentLoader().load_document(source)

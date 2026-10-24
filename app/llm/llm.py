@@ -45,8 +45,7 @@ class LLM:
 
             return response.choices[0].message.content
 
-        except Exception as e:
-
-            logger.error("LLM Error: %s", e)
+        except Exception as exc:
+            logger.error("LLM request failed (%s).", type(exc).__name__)
 
             return "Sorry, something went wrong while generating the response."
